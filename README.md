@@ -9,6 +9,7 @@ https://youtu.be/Gr-7CdJrsGw
 Used materials:
 - Arduino with CAN interface: http://docs.longan-labs.cc/1030008/
 - Motor driver: https://tutorial.cytron.io/2013/07/29/controlling-md10c-with-arduino/
+- LCD: https://wiki.seeedstudio.com/Grove-16x2_LCD_Series/
 - Oil pressure sensor: https://prosportgauges.com/products/premium-oil-fuel-pressure-sender
 
 Reference links:
