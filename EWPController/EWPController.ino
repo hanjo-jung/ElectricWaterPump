@@ -357,8 +357,8 @@ void SetPumpDuty()
     Diff1sec[TempIndex] = CurTemp - Temp1sec[prevIdx[TempIndex]];
     diverge = CurTemp - TargetTemp;
     Accu1sec[TempIndex] = diverge;
-    diverge = (diverge >= 15) ? 15 : diverge;
-    defaultDutyIdx = 4 + ((diverge > 0) ? log10val[diverge] : 0);
+    diverge = (diverge > 15) ? 15 : ((diverge < 0) ? 0 : diverge);
+    defaultDutyIdx = 4 + log10val[diverge];
     DBG1(TempIndex); DBG1(", "); DBG1(CurTemp); DBG1(" D"); DBG1(diverge); DBG1(", ");
     TempIndex = nextIdx[TempIndex];
 
@@ -425,41 +425,47 @@ void SetPumpDuty()
         {
           if (diff < 0) delta = -3;
           else if (diff == 0) delta = -3;
-          else delta = 1;
+          else
+          {
+            diverge = CurTemp - (TargetTemp - 2);
+            diverge = (diverge < 0) ? 0 : ((diverge > 15) ? 15: diverge);
+            delta = log10val[diverge];
+          }
         }
-        else if (accu > 0)
+        else if (accu == 0)
         {
-          if (diff < 0) delta = CurTemp - TargetTemp; // < 0
-          else if (diff == 0) delta = 0;
-          else delta = 1;
+          if (diff < 0) delta = -3;
+          else if (diff == 0) delta = -1;
+          else
+          {
+            diverge = CurTemp - (TargetTemp - 2);
+            diverge = (diverge < 0) ? 0 : ((diverge > 15) ? 15: diverge);
+            delta = log10val[diverge];
+          }
         }
         else
         {
-          if (diff < 0) delta = CurTemp - TargetTemp; // < 0
+          if (diff < 0) delta = -3;
           else if (diff == 0) delta = 0;
-          else delta = 1;
+          else
+          {
+            diverge = CurTemp - (TargetTemp - 2);
+            diverge = (diverge < 0) ? 0 : ((diverge > 15) ? 15: diverge);
+            delta = log10val[diverge];
+          }
         }
       }
-      else if (CurTemp >= TargetTemp)
+      else if (CurTemp == TargetTemp)
       {
-        if (accu < 0)
-        {
-          if (diff < 0) delta = log10val[CurTemp - TargetTemp];
-          else if (diff == 0) delta = 1 << log10val[CurTemp - TargetTemp];
-          else delta = diff << log10val[CurTemp - TargetTemp];
-        }
-        else if (accu > 0)
-        {
-          if (diff < 0) delta = log10val[CurTemp - TargetTemp];
-          else if (diff == 0) delta = 1 << log10val[CurTemp - TargetTemp];
-          else delta = diff << log10val[CurTemp - TargetTemp];
-        }
-        else
-        {
-          if (diff < 0) delta = log10val[CurTemp - TargetTemp];
-          else if (diff == 0) delta = 1 << log10val[CurTemp - TargetTemp];
-          else delta = diff << log10val[CurTemp - TargetTemp];
-        }
+        if (diff < 0) delta = -1;
+        else if (diff == 0) delta = 0;
+        else delta = diff << log10val[diverge]; // diff * 2^x
+      }
+      else
+      {
+        if (diff < 0) delta = diverge;
+        else if (diff == 0) delta = log10val[diverge];
+        else delta = diff << log10val[diverge]; // diff * 2^x
       }
 
       if (delta < -3) delta = -3; // to avoid IndexDuty == 0 case
