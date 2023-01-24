@@ -1,7 +1,16 @@
 # ElectricWaterPump
 
 A PWM controller for an electric water pump like Davies-Craig EWP-80.
-Also it has features that read water and oil temparatures and RPM from the CAN Bus, and read an oil pressure sensor signal which varies from 0 to 5 volts.
+
+Features:
+- Reads water and oil temparatures and RPM from the CAN Bus.
+- Reads an oil pressure sensor signal.
+- Sends PWM signal to a motor driver, MD10C.
+- Has an emergency switch to drive 100% PWM signal.
+
+Recent pictures:
+![image](https://user-images.githubusercontent.com/49624742/214237019-a1efb4db-29e4-42bd-bda2-30e244f3e774.png)
+
 
 Pictures of the first installation:
 
@@ -21,6 +30,7 @@ Used materials:
 - Oil pressure sensor: https://prosportgauges.com/products/premium-oil-fuel-pressure-sender
 
 Reference links:
+- https://www.ft86club.com/forums/showthread.php?t=90692
 - https://github.com/wiretap/brz_cangateway/blob/master/cangateway.ino
 - https://github.com/timurrrr/RaceChronoDiyBleDevice
 - https://github.com/iDoka/awesome-automotive-can-id
