@@ -302,6 +302,11 @@ int SumOfDelta()
   return accu;
 }
 
+int Trim16(int value)
+{
+  return (value < 0) ? 0 : ((value > 15) ? 15: value);
+}
+
 void SetPumpDuty()
 {
   const unsigned char nextIdx[16] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 0, 1, 2, 3, 4, 5, 6};
@@ -357,7 +362,7 @@ void SetPumpDuty()
     Diff1sec[TempIndex] = CurTemp - Temp1sec[prevIdx[TempIndex]];
     diverge = CurTemp - TargetTemp;
     Accu1sec[TempIndex] = diverge;
-    diverge = (diverge > 15) ? 15 : ((diverge < 0) ? 0 : diverge);
+    diverge = Trim16(diverge);
     defaultDutyIdx = 4 + log10val[diverge];
     DBG1(TempIndex); DBG1(", "); DBG1(CurTemp); DBG1(" D"); DBG1(diverge); DBG1(", ");
     TempIndex = nextIdx[TempIndex];
@@ -383,7 +388,7 @@ void SetPumpDuty()
 
     if (CurTemp < LowTemp) // Low=88, WarmUp=80
     {
-      if (!IsWarmedUp && IsReadBegan && !IsEngineStopped)
+      if (IsReadBegan && !IsEngineStopped)
       {
         WarmUpCnt++;
         // try to pulse 2 second per 10 seconds
@@ -400,16 +405,6 @@ void SetPumpDuty()
           IndexDuty = 1; // 1.25%
         }
       }
-      else
-      {
-        int diff = WarmUpTemp - CurTemp;
-        if (diff < 0)
-          IndexDuty = 3;
-        else if (0 <= diff && diff < 20)
-          IndexDuty = 2;
-        else
-          IndexDuty = 1;
-      }
     }
     else if (CurTemp >= MaxTemp || IsOilHot || IsHighReached)
     {
@@ -418,54 +413,25 @@ void SetPumpDuty()
     else
     {
       int delta;
+      int bonus = Trim16(CurTemp - (TargetTemp - 2));
 
       if (CurTemp < TargetTemp)
       {
-        if (accu < 0)
-        {
-          if (diff < 0) delta = -3;
-          else if (diff == 0) delta = -3;
-          else
-          {
-            diverge = CurTemp - (TargetTemp - 2);
-            diverge = (diverge < 0) ? 0 : ((diverge > 15) ? 15: diverge);
-            delta = log10val[diverge];
-          }
-        }
-        else if (accu == 0)
-        {
-          if (diff < 0) delta = -3;
-          else if (diff == 0) delta = -1;
-          else
-          {
-            diverge = CurTemp - (TargetTemp - 2);
-            diverge = (diverge < 0) ? 0 : ((diverge > 15) ? 15: diverge);
-            delta = log10val[diverge];
-          }
-        }
-        else
-        {
-          if (diff < 0) delta = -3;
-          else if (diff == 0) delta = 0;
-          else
-          {
-            diverge = CurTemp - (TargetTemp - 2);
-            diverge = (diverge < 0) ? 0 : ((diverge > 15) ? 15: diverge);
-            delta = log10val[diverge];
-          }
-        }
+        if (diff < 0) delta = -3;
+        else if (diff == 0) delta = (accu >= -10) ? log10val[bonus] : -1;
+        else delta = log10val[bonus];
       }
       else if (CurTemp == TargetTemp)
       {
-        if (diff < 0) delta = -1;
-        else if (diff == 0) delta = 0;
-        else delta = diff << log10val[diverge]; // diff * 2^x
+        if (diff < 0) delta = 0;
+        else if (diff == 0) delta = (accu > 0) ? 2 : 0;
+        else delta = 4;
       }
       else
       {
         if (diff < 0) delta = diverge;
-        else if (diff == 0) delta = log10val[diverge];
-        else delta = diff << log10val[diverge]; // diff * 2^x
+        else if(diff == 0) delta = log10val[diverge];
+        else delta = log10val[bonus];
       }
 
       if (delta < -3) delta = -3; // to avoid IndexDuty == 0 case
@@ -536,9 +502,6 @@ void SetBusError(char c, int line)
 {
   IsCANBusError = true; MaskSet = '.'; FilterSet = '.';
   IsReadBegan = false;
-  //PrevOil = -40; PrevTemp = -40;
-  //lcd.setCursor(10, 0); lcd.print(' ');
-  //lcd.setCursor(2, 0); lcd.print(c); lcd.setCursor(1, 1); lcd.print(line);
 }
 
 void SetBusErrorRetry(char c, int line)
@@ -546,9 +509,7 @@ void SetBusErrorRetry(char c, int line)
   EmptyCnt = EmptyThreshold;
   IsCANBusError = true; MaskSet = '.'; FilterSet = '.';
   IsReadBegan = false;
-  //PrevOil = -40; PrevTemp = -40;
-  //lcd.setCursor(10, 0); lcd.print(' ');
-  //lcd.setCursor(1, 0); lcd.print(c); lcd.setCursor(1, 1); lcd.print(line);
+
   if (c == 't' || c == 'x')
   {
     lcd.setCursor(OilOffset + 2, OilRow); lcd.print('?');
@@ -562,7 +523,6 @@ void SetBusErrorRetry(char c, int line)
 
 void SetBusSuccess(char c, int line)
 {
-  //lcd.setCursor(10, 0); lcd.print(c);// lcd.setCursor(1, 1); lcd.print(line);
   IsCANBusError = false;
 }
 
@@ -679,75 +639,12 @@ void LogRpmAndOilPressure()
 
 int GetCurrentOP()
 {
-#if 1
   if (OPLogHead == OPLogTail)
   {
     return -1;
   }
   
   return OilPressureLogs[(OPLogTail + OPLogSize - 1) % OPLogSize].psi;
-
-#else
-  const int range = 25;
-  const int thr = 10; // 2 second
-  int rpm = CurRPM;
-  int psiAtRpm = 0;
-  int bi = OPLogHead;
-  if (OPLogHead < OPLogTail)
-  {
-    if (OPLogTail - OPLogHead > thr)
-      bi = (OPLogTail + OPLogSize - thr) % OPLogSize;
-    for (int i = bi; i < OPLogTail; ++i)
-    {
-      if (rpm - range <= OilPressureLogs[i].rpm &&
-          OilPressureLogs[i].rpm < rpm + range && psiAtRpm < OilPressureLogs[i].psi)
-      {
-        psiAtRpm = OilPressureLogs[i].psi;
-      }
-    }
-  }
-  else if (OPLogTail < OPLogHead)
-  {
-    if ((OPLogSize - OPLogHead) + OPLogTail > thr)
-      bi = (OPLogTail + OPLogSize - thr) % OPLogSize;
-
-    if (bi < OPLogTail)
-    {
-      for (int i = bi; i < OPLogTail; ++i)
-      {
-        if (rpm - range <= OilPressureLogs[i].rpm &&
-            OilPressureLogs[i].rpm < rpm + range && psiAtRpm < OilPressureLogs[i].psi)
-        {
-          psiAtRpm = OilPressureLogs[i].psi;
-        }
-      }
-    }
-    else if (OPLogTail < bi)
-    {
-      for (int i = bi; i < OPLogSize; ++i)
-      {
-        if (rpm - range <= OilPressureLogs[i].rpm &&
-            OilPressureLogs[i].rpm < rpm + range && psiAtRpm < OilPressureLogs[i].psi)
-        {
-          psiAtRpm = OilPressureLogs[i].psi;
-        }
-      }
-      for (int i = 0; i < OPLogTail; ++i)
-      {
-        if (rpm - range <= OilPressureLogs[i].rpm &&
-            OilPressureLogs[i].rpm < rpm + range && psiAtRpm < OilPressureLogs[i].psi)
-        {
-          psiAtRpm = OilPressureLogs[i].psi;
-        }
-      }
-    }
-  }
-  else
-  {
-    DBG4LN("curOP h==t");
-  }
-  return psiAtRpm;
-#endif
 }
 
 int GetMaxRpm()
