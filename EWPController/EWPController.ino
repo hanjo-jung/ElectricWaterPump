@@ -298,7 +298,7 @@ int SumOfDelta()
     int d = Accu1sec[idx[TempIndex + i]];
     accu += d;
   }
-  DBG1(" ("); DBG1(" accu "); DBG1(accu); DBG1(") ");
+  DBG1("("); DBG1("accu "); DBG1(accu); DBG1(") ");
   return accu;
 }
 
@@ -367,7 +367,7 @@ void SetPumpDuty()
     DBG1(TempIndex); DBG1(", "); DBG1(CurTemp); DBG1(" D"); DBG1(diverge); DBG1(", ");
     TempIndex = nextIdx[TempIndex];
 
-    DBG1(IndexDuty); DBG1("->");
+    DBG1(defaultDutyIdx); DBG1("->");
     diff = SumOfDifferentials();
     accu = SumOfDelta();
 
@@ -418,13 +418,13 @@ void SetPumpDuty()
       if (CurTemp < TargetTemp)
       {
         if (diff < 0) delta = -3;
-        else if (diff == 0) delta = (accu >= -10) ? log10val[bonus] : -1;
-        else delta = log10val[bonus];
+        else if (diff == 0) delta = (accu > -10) ? log10val[bonus] : (bonus == 0 ? -2 : -1);
+        else delta = (accu > -20) ? log10val[bonus] : 0;
       }
       else if (CurTemp == TargetTemp)
       {
         if (diff < 0) delta = 0;
-        else if (diff == 0) delta = (accu > 0) ? 2 : 0;
+        else if (diff == 0) delta = (accu > 0) ? 2 : 1;
         else delta = 4;
       }
       else
@@ -480,7 +480,7 @@ void SetMotorSpeed()
     int duty;
     prevIndex = IndexDuty;
     duty = Duties[IndexDuty];
-    DBG1LN(duty);
+    DBG1("motor speed: "); DBG1LN(duty);
     motor.setSpeed(duty);
   }
 }
