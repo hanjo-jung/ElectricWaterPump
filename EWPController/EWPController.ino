@@ -418,14 +418,22 @@ void SetPumpDuty()
       if (CurTemp < TargetTemp)
       {
         if (diff < 0) delta = -3;
-        else if (diff == 0) delta = (accu > -10) ? log10val[bonus] : (bonus == 0 ? -2 : -1);
+        else if (diff == 0)
+        {
+          if (accu >= -10)
+            delta = 3;
+          else if (accu >= -20)
+            delta = 0;
+          else
+            delta = -1;
+        }
         else delta = (accu > -20) ? log10val[bonus] : 0;
       }
       else if (CurTemp == TargetTemp)
       {
         if (diff < 0) delta = 0;
-        else if (diff == 0) delta = (accu > 0) ? 2 : 1;
-        else delta = 4;
+        else if (diff == 0) delta = (accu >= 0) ? 2 : 0;
+        else delta = (accu > -10) ? (10 + accu) : 4;
       }
       else
       {
