@@ -607,7 +607,7 @@ int ReadOilPressureSensor()
   float psi = (voltage - 0.5) * (145 / 4.0);
 
   if (psi < 0)
-    return (int)(psi + 0.5); // round
+    psi = 0;
 
   float estimatedPsi = PressureKalmanFilter.updateEstimate(psi);
   DBG4("Pr "); DBG4(value); DBG4(" "); DBG4(voltage); DBG4(" V ");
