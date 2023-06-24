@@ -595,6 +595,8 @@ void loop()
   }
 }
 
+float VoltOffset = 0.0;
+
 int ReadOilPressureSensor()
 {
   int value = analogRead(OilPressurePin);
@@ -604,6 +606,13 @@ int ReadOilPressureSensor()
    * PSI  0    29   72.5 116  145
    * V    0.5  1.3  2.5  3.7  4.5
    */
+  // 0.1 <= voltage < 0.5 : adjust offset 
+  if (0.1 <= voltage && voltage < 0.5)
+  {
+    VoltOffset = 0.5 - voltage;
+  }
+  voltage = voltage + VoltOffset;
+
   float psi = (voltage - 0.5) * (145 / 4.0);
 
   if (psi < 0)
@@ -1037,6 +1046,11 @@ void DispOilPressure()
   // current oil pressure
   lcd.setCursor(PressureOffset, 0);
   DispPsi(cur);
+  if (VoltOffset == 0.0) lcd.print(' ');
+  else if (VoltOffset < 0.1) lcd.print('_');
+  else if (VoltOffset < 0.3) lcd.print('+');
+  else if (VoltOffset < 0.5) lcd.print('^');
+  else lcd.print('?');
   // maximum during past 10 seconds
   lcd.setCursor(PressureOffset, PressureRow);
   DispPsi(localMax);
