@@ -107,6 +107,7 @@ const int HeartbeatOffset = 10;
 const int HeartbeatRow = 1;
 const int PumpOffset = 11;
 const int PumpRow = 1;
+const int OPLogSize = 150; // 5Hz 30sec maybe
 
 rgb_lcd lcd;
 
@@ -157,6 +158,10 @@ unsigned int CANBusResetCount = 0;
 char MaskSet = '.';
 char FilterSet = '.';
 
+int IntervalCount = 0;
+bool RpmStop = false;
+bool TempStop = false;
+
 int PrevTemp = -40;
 int PrevOil = -40;
 int PrevDuty = -1;
@@ -167,6 +172,16 @@ unsigned int PrevTempCnt = 0;
 unsigned int RpmCnt = 0;
 unsigned int TempCnt = 0;
 unsigned int Heartbeat = 0;
+
+struct PressureLogT
+{
+  int rpm;
+  int psi;
+} OilPressureLogs[OPLogSize];
+int OPLogHead = 0;
+int OPLogTail = 0;
+struct PressureLogT OPToDisp;
+float VoltOffset = 0.0;
 
 volatile unsigned char flagRecv = 0;
 volatile unsigned char checkBus = 0;
@@ -184,6 +199,7 @@ void init_arrays()
 #endif
     RpmHistory[i] = 0;
   }
+  memset(OilPressureLogs, 0, OPLogSize * sizeof(struct PressureLogT));
 }
 
 void init_vars()
@@ -208,12 +224,20 @@ void init_vars()
   MaskSet = '.';
   FilterSet = '.';
 
+  IntervalCount = 0;
+  RpmStop = false;
+  TempStop = false;
+
   PrevTemp = -40;
   PrevOil = -40;
   PrevDuty = -1;
   PrevVolt = -1;
   PrevRpm = -1;
   Heartbeat = 0;
+
+  OPLogHead = 0;
+  OPLogTail = 0;
+  VoltOffset = 0.0;
 }
 
 void init_flags()
@@ -595,8 +619,6 @@ void loop()
   }
 }
 
-float VoltOffset = 0.0;
-
 int ReadOilPressureSensor()
 {
   int value = analogRead(OilPressurePin);
@@ -614,25 +636,13 @@ int ReadOilPressureSensor()
   voltage = voltage + VoltOffset;
 
   float psi = (voltage - 0.5) * (145 / 4.0);
-
-  if (psi < 0)
-    psi = 0;
+  if (psi < 0) { psi = 0; }
 
   float estimatedPsi = PressureKalmanFilter.updateEstimate(psi);
   DBG4("Pr "); DBG4(value); DBG4(" "); DBG4(voltage); DBG4(" V ");
   DBG4(psi); DBG4(" "); DBG4(estimatedPsi); DBG4LN(" psi");
   return (int)(estimatedPsi + 0.5); // round
 }
-
-const int OPLogSize = 150; // 5Hz 30sec maybe
-struct PressureLogT
-{
-  int rpm;
-  int psi;
-} OilPressureLogs[OPLogSize];
-int OPLogHead = 0;
-int OPLogTail = 0;
-struct PressureLogT OPToDisp;
 
 void AddToOPLog(int rpm, int psi)
 {
@@ -650,17 +660,13 @@ void LogRpmAndOilPressure()
 {
   int psi = ReadOilPressureSensor();
   int rpm = CurRPM;
-  if (psi < 0) return;
+  if (psi < 0) { return; }
   AddToOPLog(rpm, psi);
 }
 
 int GetCurrentOP()
 {
-  if (OPLogHead == OPLogTail)
-  {
-    return -1;
-  }
-  
+  if (OPLogHead == OPLogTail) { return -1; }
   return OilPressureLogs[(OPLogTail + OPLogSize - 1) % OPLogSize].psi;
 }
 
@@ -737,10 +743,6 @@ void GetMaxRecentOPLog()
   OPToDisp.psi = psiAtMaxRpm;
 }
 
-int IntervalCount = 0;
-bool RpmStop = false;
-bool TempStop = false;
-
 void CheckCount()
 {
   IntervalCount++;
@@ -752,8 +754,8 @@ void CheckCount()
     TempStop = (PrevTempCnt == TempCnt) ? true : false;
     PrevRpmCnt = RpmCnt;
     PrevTempCnt = TempCnt;
-    if (!RpmStop) c = 't'; 
-    if (!TempStop) c = 'r';
+    if (!RpmStop) { c = 't'; }
+    if (!TempStop) { c = 'r'; }
     if (RpmStop || TempStop)
     {
       SetBusErrorRetry(c, __LINE__);
@@ -918,14 +920,8 @@ void Display()
     perSecond = true;
     LcdUpdateCount = 0;
     lcd.setCursor(HeartbeatOffset, HeartbeatRow);
-    if (++Heartbeat & 1)
-    {
-      lcd.print("p");
-    }
-    else
-    {
-      lcd.print("P");
-    }
+    if (++Heartbeat & 1) { lcd.print("p"); }
+    else { lcd.print("P"); }
   }
 
 #ifndef TEST
@@ -1019,18 +1015,9 @@ void Display()
 
 void DispPsi(int psi)
 {
-  if (psi < 0)
-  {
-    psi = 0;
-  }
-  if (psi < 10)
-  {
-    lcd.print("  ");
-  }
-  else if (psi < 100)
-  {
-    lcd.print(" ");
-  }
+  if (psi < 0) { psi = 0; }
+  if (psi < 10) { lcd.print("  "); }
+  else if (psi < 100) { lcd.print(" "); }
   lcd.print(psi);
 }
 
@@ -1046,20 +1033,18 @@ void DispOilPressure()
   // current oil pressure
   lcd.setCursor(PressureOffset, 0);
   DispPsi(cur);
-  if (VoltOffset == 0.0) lcd.print(' ');
-  else if (VoltOffset < 0.1) lcd.print('_');
-  else if (VoltOffset < 0.3) lcd.print('+');
-  else if (VoltOffset < 0.5) lcd.print('^');
-  else lcd.print('?');
+  lcd.setCursor(PressureOffset + 3, 0);
+  if (VoltOffset == 0.0) { lcd.print(' '); }
+  else if (VoltOffset < 0.1) { lcd.print('_'); }
+  else if (VoltOffset < 0.3) { lcd.print('+'); }
+  else if (VoltOffset < 0.5) { lcd.print('^'); }
+  else { lcd.print('?'); }
   // maximum during past 10 seconds
   lcd.setCursor(PressureOffset, PressureRow);
   DispPsi(localMax);
   // RPM at max pressure
   lcd.setCursor(RpmOffset, RpmRow);
-  if (rpm < 10)
-  {
-    lcd.print(" ");
-  }
+  if (rpm < 10) { lcd.print(' '); }
   lcd.print(rpm);
 }
 
@@ -1073,42 +1058,20 @@ void DispOilPressure()
     lcd.print("err");
     return;
   }
-  if (rpm < 10)
-  {
-    lcd.print("   ");
-  }
-  else if (rpm < 100)
-  {
-    lcd.print("  ");
-  }
-  else if (rpm < 1000)
-  {
-    lcd.print(" ");
-  }
+  if (rpm < 10) { lcd.print("   "); }
+  else if (rpm < 100) { lcd.print("  "); }
+  else if (rpm < 1000) { lcd.print(" "); }
   lcd.print(rpm);
 }*/
 
 void DispTemp(int temp, int col, int row)
 {
   lcd.setCursor(col, row);
-  if (temp <= -10)
-  { //-10
-  }
-  else if (temp < 0)
-  { // -1
-    lcd.print(" ");
-  }
-  else if (temp < 10)
-  { //  9
-    lcd.print("  ");
-  }
-  else if (temp < 100)
-  { // 99
-    lcd.print(" ");
-  }
-  else
-  { //100
-  }
+  if (temp <= -10) { /*-10*/ }
+  else if (temp < 0) { /* -1*/ lcd.print(" "); }
+  else if (temp < 10) { /*  9*/ lcd.print("  "); }
+  else if (temp < 100) { /* 99*/ lcd.print(" "); }
+  else { /*100*/ }
   lcd.print(temp);
 }
 
@@ -1120,8 +1083,7 @@ void DispTemp(int temp, int col, int row)
     lcd.print(" ");
     lcd.print(volt / 10);
   }
-  else
-    lcd.print(volt / 10);
+  else { lcd.print(volt / 10); }
   lcd.print(".");
   lcd.print(volt % 10);  
 }*/
