@@ -622,18 +622,16 @@ void loop()
 int ReadOilPressureSensor()
 {
   int value = analogRead(OilPressurePin);
-  float voltage = value * (5.0 / 1023.0);
+  float voltage = value * 5.0 / 1023.0;
   /*       Linear scale
    * Bar  0    2    5    8    10
    * PSI  0    29   72.5 116  145
    * V    0.5  1.3  2.5  3.7  4.5
    */
-  // 0.1 <= voltage < 0.5 : adjust offset 
-  if (0.1 <= voltage && voltage < 0.5)
+  if (voltage < 0.5 || 4.5 < voltage)
   {
-    VoltOffset = 0.5 - voltage;
+    return -1;
   }
-  voltage = voltage + VoltOffset;
 
   float psi = (voltage - 0.5) * (145 / 4.0);
   if (psi < 0) { psi = 0; }
