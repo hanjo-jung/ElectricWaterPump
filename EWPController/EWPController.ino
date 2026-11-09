@@ -106,12 +106,41 @@ const int HeartbeatOffset = 10;
 const int HeartbeatRow = 1;
 const int PumpOffset = 11;
 const int PumpRow = 1;
+const int DipMarkOffset = 4; // oil pressure dip indicator
+const int DipMarkRow = 0;
 const int OPLogSize = 150; // 5Hz 30sec maybe
 // Oil pressure filter: oversampled ADC -> median (spike rejection) -> EMA (smoothing)
 const int OPOversample = 4;          // analogRead() calls averaged per sample
 const int OPMedianSize = 5;          // rejects up to 2 consecutive spikes
 const float OPEmaAlpha = 0.3;        // ~0.15 s time constant at 20 Hz
 const int OPCalibMinSamples = 20;    // ~1 s of samples before trusting the 0 psi voltage
+const unsigned long OPSampleMs = 50; // 20 Hz, independent of CAN reception
+// Oil pressure warning
+const int BuzzerPin = -1;            // set to a free digital pin (e.g. 8) to enable an active-high buzzer
+const unsigned long RpmStaleMs = 2000;     // RPM older than this is treated as unknown
+const int OPMonitorMinRpm = 500;           // below this the engine is treated as not running
+const unsigned long OPStartDelayMs = 3000; // ignore pressure build-up right after start
+const unsigned long OPDipMs = 300;         // low this long -> DIP
+const unsigned long OPLossMs = 2000;       // low this long -> LOSS
+const unsigned long OPRecoverMs = 1000;    // above min + hysteresis this long -> NORMAL
+const int OPHysteresisPsi = 3;
+const int OPNoRpmMinPsi = 5;               // min psi when RPM is unknown (CAN lost)
+const float OPSensorMinVolt = 0.1;         // below: open circuit / short to GND
+const float OPSensorMaxVolt = 4.8;         // above: short to 5V
+const unsigned char OP_NORMAL = 0;
+const unsigned char OP_DIP = 1;
+const unsigned char OP_LOSS = 2;
+const unsigned char OP_SENSOR_FAULT = 3;
+// HD44780 ROM font glyphs; stored inverted into CGRAM 0..4 for reverse video
+const unsigned char InvGlyphSrc[5][8] = {
+  {0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E, 0x00}, // O
+  {0x0E, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0E, 0x00}, // I
+  {0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1F, 0x00}, // L
+  {0x11, 0x11, 0x11, 0x15, 0x15, 0x15, 0x0A, 0x00}, // W
+  {0x04, 0x04, 0x04, 0x04, 0x04, 0x00, 0x04, 0x00}, // !
+};
+const unsigned char InvO = 0, InvI = 1, InvL = 2, InvW = 3, InvExcl = 4;
+const unsigned char InvSpace = 0xFF; // ROM full block
 
 rgb_lcd lcd;
 
@@ -183,6 +212,14 @@ float OPVoltRaw[OPMedianSize];
 int OPVoltIdx = 0;
 int OPVoltSamples = 0;
 float OPVoltEma = 0.0;
+unsigned char OPAlarm = OP_NORMAL;
+unsigned int OPDipCount = 0;
+unsigned long LastRpmMs = 0;
+unsigned long LastOPSampleMs = 0;
+unsigned long OPRunningSince = 0;
+unsigned long OPLowSince = 0;
+unsigned long OPOkSince = 0;
+unsigned long BuzzerUntil = 0;
 
 volatile unsigned char flagRecv = 0;
 volatile unsigned char checkBus = 0;
@@ -243,6 +280,14 @@ void init_vars()
   OPVoltIdx = 0;
   OPVoltSamples = 0;
   OPVoltEma = 0.0;
+  OPAlarm = OP_NORMAL;
+  OPDipCount = 0;
+  LastRpmMs = 0;
+  LastOPSampleMs = 0;
+  OPRunningSince = 0;
+  OPLowSince = 0;
+  OPOkSince = 0;
+  BuzzerUntil = 0;
 }
 
 void init_flags()
@@ -576,7 +621,12 @@ void setup()
 {
   // switch input
   pinMode(OnPin, INPUT);
-  
+  if (BuzzerPin >= 0)
+  {
+    pinMode(BuzzerPin, OUTPUT);
+    digitalWrite(BuzzerPin, LOW);
+  }
+
   init_arrays();
   init_vars();
   init_flags();
@@ -603,6 +653,7 @@ void setup()
 void loop()
 {
   taskCanRecv();
+  SampleOilPressure();
   if (flagRecv)
   {
     flagRecv = 0;
@@ -661,11 +712,10 @@ float ReadOilPressureVoltage()
   return OPVoltEma;
 }
 
-// Called on RPM packets with RPM == 0 before the engine has started (key on).
+// Called while RPM == 0 is reported before the engine has started (key on).
 // Oil pressure is truly 0 psi then, so the filtered voltage is the sensor's 0 psi point.
-void CalibrateOilPressureOffset()
+void CalibrateOilPressureOffset(float voltage)
 {
-  float voltage = ReadOilPressureVoltage();
   if (OPVoltSamples < OPCalibMinSamples) { return; }
   // 0.1 <= voltage < 0.5 : adjust offset (below 0.1 V the sensor is likely disconnected)
   if (0.1 <= voltage && voltage < 0.5)
@@ -674,20 +724,133 @@ void CalibrateOilPressureOffset()
   }
 }
 
-int ReadOilPressureSensor()
+// filtered sensor voltage (offset not applied) -> psi
+int OilPsiFromVoltage(float voltage)
 {
   /*       Linear scale
    * Bar  0    2    5    8    10
    * PSI  0    29   72.5 116  145
    * V    0.5  1.3  2.5  3.7  4.5
    */
-  float voltage = ReadOilPressureVoltage() + VoltOffset;
-
-  float psi = (voltage - 0.5) * (145 / 4.0);
+  float psi = (voltage + VoltOffset - 0.5) * (145 / 4.0);
   if (psi < 0) { psi = 0; }
-
-  DBG4("Pr "); DBG4(voltage); DBG4(" V "); DBG4(psi); DBG4LN(" psi");
   return (int)(psi + 0.5); // round
+}
+
+// minimum healthy oil pressure for the RPM
+int MinOilPsi(int rpm, bool rpmValid)
+{
+  if (!rpmValid) { return OPNoRpmMinPsi; }
+  if (rpm < 1500) { return 6; }
+  if (rpm < 3000) { return 15; }
+  if (rpm < 4500) { return 25; }
+  return 35;
+}
+
+/*
+ * NORMAL -> DIP : below the minimum for OPDipMs (e.g. oil starvation in a corner), latched in OPDipCount
+ * DIP -> LOSS   : still below the minimum after OPLossMs
+ * -> NORMAL     : at least minimum + hysteresis for OPRecoverMs
+ * SENSOR_FAULT  : sensor voltage out of range, overrides the others
+ */
+void CheckOilPressure(unsigned long now, bool sensorOk, int psi, bool rpmValid)
+{
+  unsigned char prev = OPAlarm;
+
+  if (!sensorOk)
+  {
+    OPAlarm = OP_SENSOR_FAULT;
+    OPLowSince = 0; OPOkSince = 0;
+  }
+  else
+  {
+    if (OPAlarm == OP_SENSOR_FAULT) { OPAlarm = OP_NORMAL; }
+
+    // without RPM (CAN lost) assume running once the engine has started
+    bool running = rpmValid ? (CurRPM >= OPMonitorMinRpm) : HasEngineStarted;
+    if (!running)
+    {
+      OPRunningSince = 0; OPLowSince = 0; OPOkSince = 0;
+      OPAlarm = OP_NORMAL;
+    }
+    else
+    {
+      if (OPRunningSince == 0) { OPRunningSince = now; }
+      if (now - OPRunningSince >= OPStartDelayMs)
+      {
+        int minPsi = MinOilPsi(CurRPM, rpmValid);
+        if (psi < minPsi)
+        {
+          OPOkSince = 0;
+          if (OPLowSince == 0) { OPLowSince = now; }
+          unsigned long low = now - OPLowSince;
+          if (low >= OPLossMs) { OPAlarm = OP_LOSS; }
+          else if (low >= OPDipMs && OPAlarm == OP_NORMAL)
+          {
+            OPAlarm = OP_DIP;
+            OPDipCount++;
+          }
+        }
+        else
+        {
+          OPLowSince = 0;
+          if (psi >= minPsi + OPHysteresisPsi)
+          {
+            if (OPOkSince == 0) { OPOkSince = now; }
+            if (now - OPOkSince >= OPRecoverMs) { OPAlarm = OP_NORMAL; }
+          }
+          else
+          {
+            OPOkSince = 0;
+          }
+        }
+      }
+    }
+  }
+
+  if (OPAlarm != prev)
+  {
+    if (OPAlarm == OP_DIP) { BuzzerUntil = now + 200; }               // one beep
+    else if (OPAlarm == OP_SENSOR_FAULT) { BuzzerUntil = now + 100; } // short beep
+    DBG4("OP alarm "); DBG4(prev); DBG4("->"); DBG4(OPAlarm); DBG4(" psi "); DBG4(psi);
+    DBG4(" rpm "); DBG4(rpmValid ? CurRPM : -1); DBG4(" dips "); DBG4LN(OPDipCount);
+  }
+}
+
+void UpdateBuzzer(unsigned long now)
+{
+  if (BuzzerPin < 0) { return; }
+  bool on;
+  if (OPAlarm == OP_LOSS) { on = ((now / 250) & 1) == 0; } // 2 Hz beeping
+  else { on = (long)(BuzzerUntil - now) > 0; }
+  digitalWrite(BuzzerPin, on ? HIGH : LOW);
+}
+
+// Called from loop(); samples every OPSampleMs independent of CAN reception
+// so that oil pressure is still monitored when the CAN bus is lost.
+void SampleOilPressure()
+{
+  unsigned long now = millis();
+  if (now - LastOPSampleMs < OPSampleMs) { return; }
+  LastOPSampleMs = now;
+
+  bool rpmValid = HasRpmReceived && (now - LastRpmMs) < RpmStaleMs;
+  float voltage = ReadOilPressureVoltage();
+
+  if (rpmValid && CurRPM == 0 && !HasEngineStarted)
+  {
+    // key on, engine not yet started: learn the 0 psi sensor offset
+    CalibrateOilPressureOffset(voltage);
+  }
+
+  bool sensorOk = (OPSensorMinVolt <= voltage && voltage <= OPSensorMaxVolt);
+  int psi = OilPsiFromVoltage(voltage);
+  if (sensorOk && rpmValid && CurRPM > 0)
+  {
+    AddToOPLog(CurRPM, psi);
+  }
+  CheckOilPressure(now, sensorOk, psi, rpmValid);
+  UpdateBuzzer(now);
 }
 
 void AddToOPLog(int rpm, int psi)
@@ -699,15 +862,6 @@ void AddToOPLog(int rpm, int psi)
   {
     OPLogHead = (OPLogHead + 1) % OPLogSize;
   }
-}
-
-// read per RPM packet, so 20Hz
-void LogRpmAndOilPressure()
-{
-  int psi = ReadOilPressureSensor();
-  int rpm = CurRPM;
-  if (psi < 0) { return; }
-  AddToOPLog(rpm, psi);
 }
 
 int GetCurrentOP()
@@ -908,6 +1062,7 @@ void taskCanRecv()
     {
       RpmCnt++;
       HasRpmReceived = true;
+      LastRpmMs = millis();
       if (RpmIndex < 0 || 10 <= RpmIndex)
       {
         RpmIndex = 0;
@@ -931,12 +1086,6 @@ void taskCanRecv()
         IsEngineStopped = false;
         HasEngineStarted = true;
         DBGLN("Engine running");
-        LogRpmAndOilPressure();
-      }
-      else if (!HasEngineStarted)
-      {
-        // key on, engine not yet started: learn the 0 psi sensor offset
-        CalibrateOilPressureOffset();
       }
       DBG("RPM "); DBGLN(CurRPM);
     }
@@ -946,6 +1095,12 @@ void taskCanRecv()
 void LcdInit()
 {
   lcd.begin(16, 2);
+  for (int i = 0; i < 5; ++i)
+  {
+    uint8_t glyph[8];
+    for (int r = 0; r < 8; ++r) { glyph[r] = InvGlyphSrc[i][r] ^ 0x1F; }
+    lcd.createChar(i, glyph);
+  }
   lcd.setCursor(0, 0);
   lcd.print("---  O--- ");
   lcd.print("W---");
@@ -1048,6 +1203,9 @@ void Display()
     }*/
   }
 
+  // shown regardless of CAN state; oil pressure is sampled independently
+  DispOilWarning();
+
   if (PrevDuty != IndexDuty)
   {
     PrevDuty = IndexDuty;
@@ -1083,13 +1241,16 @@ void DispOilPressure()
   //lcd.print("---psi@-- P    %");
   // current oil pressure
   lcd.setCursor(PressureOffset, 0);
-  DispPsi(cur);
+  if (OPAlarm == OP_SENSOR_FAULT) { lcd.print("---"); }
+  else { DispPsi(cur); }
   lcd.setCursor(PressureOffset + 3, 0);
   if (VoltOffset == 0.0) { lcd.print(' '); }
   else if (VoltOffset < 0.1) { lcd.print('_'); }
   else if (VoltOffset < 0.3) { lcd.print('+'); }
   else if (VoltOffset < 0.5) { lcd.print('^'); }
   else { lcd.print('?'); }
+  // row 1 is taken by the warning message
+  if (OPAlarm == OP_LOSS || OPAlarm == OP_SENSOR_FAULT) { return; }
   // maximum during past 10 seconds
   lcd.setCursor(PressureOffset, PressureRow);
   DispPsi(localMax);
@@ -1097,6 +1258,69 @@ void DispOilPressure()
   lcd.setCursor(RpmOffset, RpmRow);
   if (rpm < 10) { lcd.print(' '); }
   lcd.print(rpm);
+}
+
+void PrintOilLow(bool inverse)
+{
+  const char text[] = "OIL LOW!";
+  const unsigned char inv[8] = {InvO, InvI, InvL, InvSpace, InvL, InvO, InvW, InvExcl};
+  lcd.setCursor(PressureOffset, PressureRow);
+  for (int i = 0; i < 8; ++i)
+  {
+    lcd.write(inverse ? inv[i] : (uint8_t)text[i]);
+  }
+}
+
+/*
+ * row 0 col 4 : ' ' no dip, '!' dip happened since key on, inverted '!' dip/loss now
+ * row 1 col 0-7 : LOSS -> "OIL LOW!" blinking normal/inverted, SENSOR_FAULT -> "OP SENS?"
+ * Called every Display() tick (100 ms).
+ */
+void DispOilWarning()
+{
+  static unsigned char shown = OP_NORMAL;
+  static int shownPhase = -1;
+  static char shownMark = ' ';
+
+  char mark = ' ';
+  if (OPDipCount > 0)
+  {
+    mark = (OPAlarm == OP_DIP || OPAlarm == OP_LOSS) ? 'i' : '!';
+  }
+  if (mark != shownMark)
+  {
+    shownMark = mark;
+    lcd.setCursor(DipMarkOffset, DipMarkRow);
+    lcd.write(mark == 'i' ? InvExcl : (uint8_t)mark);
+  }
+
+  if (OPAlarm == OP_LOSS)
+  {
+    int phase = (millis() / 500) & 1;
+    if (shown != OP_LOSS)
+    {
+      shownPhase = -1;
+      lcd.setCursor(RpmOffset + 1, RpmRow); lcd.print(' '); // leave col 8 for the CAN '?' mark
+    }
+    if (phase != shownPhase)
+    {
+      shownPhase = phase;
+      PrintOilLow(phase == 0);
+    }
+  }
+  else if (OPAlarm == OP_SENSOR_FAULT)
+  {
+    if (shown != OP_SENSOR_FAULT)
+    {
+      lcd.setCursor(PressureOffset, PressureRow); lcd.print("OP SENS? ");
+    }
+  }
+  else if (shown == OP_LOSS || shown == OP_SENSOR_FAULT)
+  {
+    // restore the template; DispOilPressure() fills the digits
+    lcd.setCursor(PressureOffset, PressureRow); lcd.print("---psi@--");
+  }
+  shown = OPAlarm;
 }
 
 /*void DispRpm(int rpm, int col, int row)
