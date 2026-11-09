@@ -1,0 +1,146 @@
+# 유압 센서 필터 교체 및 유압 상실 경고 추가 (2026-11-09)
+
+브랜치: `oil-pressure-median-filter` (main 미머지, 실차 미검증)
+
+| 커밋 | 내용 |
+|---|---|
+| `d081cc1` | Replace oil pressure Kalman filter with median + EMA |
+| `20f5f4f` | Add oil pressure loss warning |
+
+변경 파일: `EWPController/EWPController.ino`
+
+---
+
+## 1. 유압 필터 교체: SimpleKalmanFilter → 오버샘플링 + median-5 + EMA
+
+### 배경
+
+유압 센서 입력에 튀는 값이 많아 `SimpleKalmanFilter(1, 1, 0.01)`을 적용해 두었으나, 다음 문제가 확인되었다.
+
+- 라이브러리의 오차 갱신식이 표준 Kalman과 다르다.
+  `e_est = (1-K)·e_est + |Δ|·q`
+  - 신호가 안정되면 `e_est → 0`, K가 0.004까지 떨어져 시정수 약 12초의 느린 저역통과 필터가 된다.
+  - 스파이크가 들어오면 `|Δ|·q` 때문에 오히려 게인이 커진다.
+- Kalman은 가우시안 노이즈 전제라 임펄스형 스파이크 제거에 맞지 않는다(median이 표준 해법).
+- 지연 때문에 LCD의 "최대 psi @ RPM"이 낮게 표시되고, 유압 상실도 늦게 보인다.
+
+### 시뮬레이션 비교
+
+20Hz, 노이즈 σ0.5psi, 3% 확률로 ±15–40psi 스파이크.
+
+| 시나리오 | 실제 | 기존 Kalman | median5 + EMA |
+|---|---|---|---|
+| 0.6초 블립 25→65psi, 피크 | 65 | 47.4 | 64.0 |
+| 유압 상실 25→3psi, 10psi 미만 표시까지 | – | 1.05초 | 0.25초 |
+| 아이들 최대 오차 | – | 0.62 | 0.94 |
+| 5분 아이들 후 시정수 | – | 약 12초 | 고정 |
+
+### 변경 내용
+
+- `ReadOilPressureVoltage()`: `analogRead` 4회 평균 → 최근 5샘플 median → EMA(α=0.3, 20Hz에서 약 0.15초).
+- 필터를 psi가 아닌 전압 단계에 적용한다. 0 psi 미만 클램프는 필터 뒤에서 하므로 0 근처 값이 위로 치우치지 않는다.
+- `SimpleKalmanFilter` 의존성 제거.
+
+| 상수 | 값 | 의미 |
+|---|---|---|
+| `OPOversample` | 4 | 샘플당 `analogRead` 평균 횟수 |
+| `OPMedianSize` | 5 | 연속 2샘플까지의 스파이크 제거 |
+| `OPEmaAlpha` | 0.3 | 평활 계수 |
+| `OPSampleMs` | 50 | 샘플 주기(20Hz) |
+
+## 2. VoltOffset 보정 방식 변경
+
+- **기존:** 엔진 회전 중 필터 전 단일 원시 샘플이 0.1–0.5V면 `VoltOffset = 0.5 - V`. 글리치 한 번으로 최대 약 14.5psi 오프셋이 리셋 전까지 남을 수 있었다.
+- **변경:** 키 온 후 시동 전(`RPM == 0` 수신, `!HasEngineStarted`)에만, 필터된 전압으로, 20샘플(약 1초) 이상 쌓인 뒤 갱신한다(`CalibrateOilPressureOffset()`).
+- 0.1–0.5V 범위 조건은 유지(0.1V 미만은 단선으로 보고 무시).
+- 주의: 키 온 후 1초 이내에 크랭킹하거나 주행 중 컨트롤러가 리셋되면 그 주행에서는 보정되지 않는다(`VoltOffset = 0`).
+
+## 3. 유압 상실 경고
+
+### 샘플링 구조
+
+유압은 RPM 패킷(`0x140`) 수신 시가 아니라 `loop()`의 `SampleOilPressure()`에서 50ms마다 읽는다. CAN이 끊겨도 유압 감시가 계속된다. `psi@RPM` 로그(`AddToOPLog`)도 여기서 쌓는다(RPM이 유효하고 0보다 클 때).
+
+### 판정 기준 (`MinOilPsi()`)
+
+| RPM | 경고 하한 | 해제 기준 (하한 + 3) |
+|---|---|---|
+| 500–1500 | 6 psi | 9 psi |
+| 1500–3000 | 15 psi | 18 psi |
+| 3000–4500 | 25 psi | 28 psi |
+| 4500+ | 35 psi | 38 psi |
+| RPM 정보 없음 (2초 이상 미수신) | 5 psi | 8 psi |
+
+하한값은 보수적인 출발값이며 실측으로 조정이 필요하다.
+
+### 상태 전이 (`CheckOilPressure()`)
+
+- `NORMAL → DIP`: 하한 미만이 0.3초 지속. `OPDipCount` 증가(코너 오일 쏠림 등 순간 저하 기록).
+- `DIP → LOSS`: 하한 미만이 2초 지속.
+- `→ NORMAL`: 하한 + 3psi 이상이 1초 유지.
+- `SENSOR_FAULT`: 필터된 전압이 0.1V 미만 또는 4.8V 초과. 다른 상태보다 우선.
+- 판정 제외: RPM 500 미만, 시동 후 3초 이내. RPM 정보가 없으면 `HasEngineStarted`로 엔진 동작을 가정.
+
+### 출력
+
+**LCD** (단색 백라이트, 역상은 CGRAM 커스텀 문자로 구현)
+
+```
+          0123456789012345
+row 0:    ---  O--- W---°C      col 4: DIP 표시 (' ' / '!' / 역상 '!')
+row 1:    ---psi@-- P    %      col 0-7: 경고 문구
+```
+
+| 상태 | 표시 |
+|---|---|
+| LOSS | row 1에 `OIL LOW!`를 0.5초마다 일반/역상으로 깜박임 |
+| SENSOR_FAULT | row 1에 `OP SENS?`, row 0 현재 유압은 `---` |
+| DIP 또는 LOSS 진행 중 | row 0 col 4에 역상 `!` |
+| 이번 시동 이후 DIP 이력 있음 | row 0 col 4에 일반 `!` |
+| 정상 복귀 | `---psi@--` 템플릿 복원 |
+
+- 역상 글리프: O, I, L, W, ! (CGRAM 0–4), 역상 공백은 ROM `0xFF`.
+- 경고 표시는 CAN 오류 상태와 무관하게 갱신된다(`Display()` → `DispOilWarning()`).
+
+**부저** (선택)
+
+- `const int BuzzerPin = -1;`을 핀 번호로 바꾸면 활성화된다. HIGH일 때 울리는 능동형 부저를 가정한다(전류가 크면 트랜지스터 사용).
+- 권장 핀: D8. 사용 중인 핀: D2/D3(LCD I2C), D4, D9(모터), D12(스위치), D14–17(CAN SPI), A0.
+
+| 상태 | 패턴 |
+|---|---|
+| DIP 진입 | 200ms 1회 |
+| LOSS | 2Hz로 계속 |
+| SENSOR_FAULT 진입 | 100ms 1회 |
+
+### 조정용 상수
+
+`OPMonitorMinRpm`(500), `OPStartDelayMs`(3000), `OPDipMs`(300), `OPLossMs`(2000), `OPRecoverMs`(1000), `OPHysteresisPsi`(3), `OPNoRpmMinPsi`(5), `OPSensorMinVolt`(0.1), `OPSensorMaxVolt`(4.8), `RpmStaleMs`(2000).
+
+## 검증
+
+- Arduino IDE로 Leonardo 대상 컴파일 성공.
+  - 정상 빌드: 플래시 16,706B(58%), RAM 1,589B(62%).
+  - `DEBUG4` 빌드: 플래시 17,962B(62%), RAM 1,681B(65%).
+- 판정 로직을 Python으로 옮겨 시나리오 확인:
+
+| 상황 | 결과 |
+|---|---|
+| 아이들 20psi, 3500rpm 45psi | 경고 없음 |
+| 4000rpm에서 1초간 10psi | 0.3초 뒤 DIP, 회복 1초 후 정상, `!` 유지 |
+| 5000rpm에서 12psi 지속 | 0.3초 뒤 DIP, 2초 뒤 LOSS |
+| 엔진 정지 후 재시동 | 오경보 없음 |
+| CAN 끊김 + 3psi | 2초 뒤 LOSS |
+| 센서 단선 | 즉시 SENSOR_FAULT |
+
+- 실차 테스트는 하지 않았다.
+
+## 남은 작업
+
+- [ ] 실차 테스트: `DEBUG4`로 원시 전압·median·EMA와 경고 상태 전이 로그 확인.
+- [ ] 열간 시 RPM별 정상 유압을 측정해 `MinOilPsi()` 하한을 정상값의 50–60%로 조정.
+- [ ] 급격한 레브업에서 오경보가 나면 `OPDipMs` 증가.
+- [ ] 부저 연결 후 `BuzzerPin` 설정.
+- [ ] 노이즈 근본 원인 점검: 센서 5V를 Arduino 5V에서 공급(비율계 측정), A0 앞 RC 필터(예: 1kΩ + 1µF), 센서 접지를 컨트롤러 GND와 공통으로, 신호선을 점화·모터 배선과 분리.
+- [ ] `OPLogSize` 주석("5Hz 30sec")과 `DispOilPressure`의 "past 10 seconds" 주석이 실제(20Hz × 150개 = 약 7.5초)와 다름.
+- [ ] 검증 후 `oil-pressure-median-filter` 브랜치를 main에 머지.
