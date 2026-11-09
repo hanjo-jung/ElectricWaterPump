@@ -1,4 +1,3 @@
-#include <SimpleKalmanFilter.h>
 #include <mcp_can.h>
 #include <mcp_can_dfs.h>
 #include <SPI.h>
@@ -108,6 +107,11 @@ const int HeartbeatRow = 1;
 const int PumpOffset = 11;
 const int PumpRow = 1;
 const int OPLogSize = 150; // 5Hz 30sec maybe
+// Oil pressure filter: oversampled ADC -> median (spike rejection) -> EMA (smoothing)
+const int OPOversample = 4;          // analogRead() calls averaged per sample
+const int OPMedianSize = 5;          // rejects up to 2 consecutive spikes
+const float OPEmaAlpha = 0.3;        // ~0.15 s time constant at 20 Hz
+const int OPCalibMinSamples = 20;    // ~1 s of samples before trusting the 0 psi voltage
 
 rgb_lcd lcd;
 
@@ -115,13 +119,6 @@ MCP_CAN CAN(SPI_CS_PIN);                                    // Set CS pin
 
 // Configure the motor driver.
 CytronMD motor(PWM_DIR, 9, 4);  // PWM = Pin 9, DIR = Pin 4.
-/*
- SimpleKalmanFilter(e_mea, e_est, q);
- e_mea: Measurement Uncertainty 
- e_est: Estimation Uncertainty 
- q: Process Noise
- */
-SimpleKalmanFilter PressureKalmanFilter(1, 1, 0.01);
 
 void timerFunc();
 
@@ -182,6 +179,10 @@ int OPLogHead = 0;
 int OPLogTail = 0;
 struct PressureLogT OPToDisp;
 float VoltOffset = 0.0;
+float OPVoltRaw[OPMedianSize];
+int OPVoltIdx = 0;
+int OPVoltSamples = 0;
+float OPVoltEma = 0.0;
 
 volatile unsigned char flagRecv = 0;
 volatile unsigned char checkBus = 0;
@@ -200,6 +201,7 @@ void init_arrays()
     RpmHistory[i] = 0;
   }
   memset(OilPressureLogs, 0, OPLogSize * sizeof(struct PressureLogT));
+  memset(OPVoltRaw, 0, OPMedianSize * sizeof(float));
 }
 
 void init_vars()
@@ -238,6 +240,9 @@ void init_vars()
   OPLogHead = 0;
   OPLogTail = 0;
   VoltOffset = 0.0;
+  OPVoltIdx = 0;
+  OPVoltSamples = 0;
+  OPVoltEma = 0.0;
 }
 
 void init_flags()
@@ -619,29 +624,70 @@ void loop()
   }
 }
 
+// median of the first n entries of buf (n <= OPMedianSize)
+float MedianOf(const float *buf, int n)
+{
+  float t[OPMedianSize];
+  for (int i = 0; i < n; ++i) // insertion sort
+  {
+    float v = buf[i];
+    int j = i - 1;
+    while (j >= 0 && t[j] > v) { t[j + 1] = t[j]; --j; }
+    t[j + 1] = v;
+  }
+  return t[n / 2];
+}
+
+// Reads the sensor and returns the filtered voltage (offset not applied).
+float ReadOilPressureVoltage()
+{
+  long sum = 0;
+  for (int i = 0; i < OPOversample; ++i)
+  {
+    sum += analogRead(OilPressurePin);
+  }
+  float voltage = sum * (5.0 / 1023.0) / OPOversample;
+
+  OPVoltRaw[OPVoltIdx] = voltage;
+  OPVoltIdx = (OPVoltIdx + 1) % OPMedianSize;
+  if (OPVoltSamples < 32767) { OPVoltSamples++; }
+  int n = (OPVoltSamples < OPMedianSize) ? OPVoltSamples : OPMedianSize;
+  float median = MedianOf(OPVoltRaw, n);
+
+  if (OPVoltSamples == 1) { OPVoltEma = median; }
+  else { OPVoltEma += OPEmaAlpha * (median - OPVoltEma); }
+
+  DBG4("Pr "); DBG4(voltage); DBG4(" med "); DBG4(median); DBG4(" ema "); DBG4LN(OPVoltEma);
+  return OPVoltEma;
+}
+
+// Called on RPM packets with RPM == 0 before the engine has started (key on).
+// Oil pressure is truly 0 psi then, so the filtered voltage is the sensor's 0 psi point.
+void CalibrateOilPressureOffset()
+{
+  float voltage = ReadOilPressureVoltage();
+  if (OPVoltSamples < OPCalibMinSamples) { return; }
+  // 0.1 <= voltage < 0.5 : adjust offset (below 0.1 V the sensor is likely disconnected)
+  if (0.1 <= voltage && voltage < 0.5)
+  {
+    VoltOffset = 0.5 - voltage;
+  }
+}
+
 int ReadOilPressureSensor()
 {
-  int value = analogRead(OilPressurePin);
-  float voltage = value * (5.0 / 1023.0);
   /*       Linear scale
    * Bar  0    2    5    8    10
    * PSI  0    29   72.5 116  145
    * V    0.5  1.3  2.5  3.7  4.5
    */
-  // 0.1 <= voltage < 0.5 : adjust offset 
-  if (0.1 <= voltage && voltage < 0.5)
-  {
-    VoltOffset = 0.5 - voltage;
-  }
-  voltage = voltage + VoltOffset;
+  float voltage = ReadOilPressureVoltage() + VoltOffset;
 
   float psi = (voltage - 0.5) * (145 / 4.0);
   if (psi < 0) { psi = 0; }
 
-  float estimatedPsi = PressureKalmanFilter.updateEstimate(psi);
-  DBG4("Pr "); DBG4(value); DBG4(" "); DBG4(voltage); DBG4(" V ");
-  DBG4(psi); DBG4(" "); DBG4(estimatedPsi); DBG4LN(" psi");
-  return (int)(estimatedPsi + 0.5); // round
+  DBG4("Pr "); DBG4(voltage); DBG4(" V "); DBG4(psi); DBG4LN(" psi");
+  return (int)(psi + 0.5); // round
 }
 
 void AddToOPLog(int rpm, int psi)
@@ -886,6 +932,11 @@ void taskCanRecv()
         HasEngineStarted = true;
         DBGLN("Engine running");
         LogRpmAndOilPressure();
+      }
+      else if (!HasEngineStarted)
+      {
+        // key on, engine not yet started: learn the 0 psi sensor offset
+        CalibrateOilPressureOffset();
       }
       DBG("RPM "); DBGLN(CurRPM);
     }
