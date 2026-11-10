@@ -108,7 +108,7 @@ const int PumpOffset = 11;
 const int PumpRow = 1;
 const int DipMarkOffset = 4; // oil pressure dip indicator
 const int DipMarkRow = 0;
-const int OPLogSize = 150; // 5Hz 30sec maybe
+const int OPLogSize = 150; // 20 Hz (OPSampleMs) x 150 = ~7.5 sec
 // Oil pressure filter: oversampled ADC -> median (spike rejection) -> EMA (smoothing)
 const int OPOversample = 4;          // analogRead() calls averaged per sample
 const int OPMedianSize = 5;          // rejects up to 2 consecutive spikes
@@ -153,6 +153,8 @@ void timerFunc();
 
 int EmptyCnt = 0;
 int LcdUpdateCount = 0;
+// Temp1sec/Diff1sec/Accu1sec: one entry per SetPumpDuty() tick (MonitorInterval = 100 ms),
+// 10 entries used, so the window spans 1 second (not one entry per second).
 int Diff1sec[16];
 int Accu1sec[16];
 int TempIndex = 0;
@@ -465,9 +467,9 @@ void SetPumpDuty()
       if (IsReadBegan && !IsEngineStopped)
       {
         WarmUpCnt++;
-        // try to pulse 2 second per 10 seconds
-        // 1..40 -> 1 to warm up coolant
-        // 41..50 -> 5 to circulate coolant
+        // pulse 1 second per 5 seconds (WarmUpCnt counts 100 ms ticks)
+        // 1..40  (4 s) -> 1 to warm up coolant
+        // 41..50 (1 s) -> 5 to circulate coolant
         if (WarmUpCnt > 40)
         {
           IndexDuty = 5; // 25%
@@ -476,7 +478,7 @@ void SetPumpDuty()
         }
         else
         {
-          IndexDuty = 1; // 1.25%
+          IndexDuty = 1; // 1.56% (4/255)
         }
       }
     }
@@ -494,8 +496,10 @@ void SetPumpDuty()
         if (diff < 0) delta = -3;
         else if (diff == 0)
         {
+          // keep below the TargetTemp steady case (+2) so duty rises with temperature:
+          // steady 90 -> 12.5%, 91 -> 25%, 92 -> 37.5%
           if (accu >= -10)
-            delta = 3;
+            delta = 1;
           else if (accu >= -20)
             delta = 0;
           else
@@ -1251,7 +1255,7 @@ void DispOilPressure()
   else { lcd.print('?'); }
   // row 1 is taken by the warning message
   if (OPAlarm == OP_LOSS || OPAlarm == OP_SENSOR_FAULT) { return; }
-  // maximum during past 10 seconds
+  // maximum in the log (OPLogSize samples, ~7.5 seconds)
   lcd.setCursor(PressureOffset, PressureRow);
   DispPsi(localMax);
   // RPM at max pressure
