@@ -1,6 +1,6 @@
 # 전동 워터펌프 제어 사양
 
-작성일: 2026-11-10 · 원본: [Claude Docs](https://claude.ai/artifact/GxVXcDQdyL5XVFb4FvAa2F)
+작성일: 2026-11-10
 
 ## 개요
 
