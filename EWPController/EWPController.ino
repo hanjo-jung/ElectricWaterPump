@@ -7,7 +7,6 @@
 #include <rgb_lcd.h>
 #include "pump_control.h"
 
-//#define NO_CAN
 //#define TEST
 //#define DEBUG
 #ifdef DEBUG
@@ -77,14 +76,19 @@ D13:  10-bit timer4
 */
 
 const int SPI_CS_PIN = 17;
+const int MotorPwmPin = 9;
+const int MotorDirPin = 4; // actually pulled down to GND
 const int OnPin = 12;
 const int OilPressurePin = A0;
 const int MonitorInterval = 100; // ms
 const int BeatsPerSecond = 1000 / MonitorInterval;
-const int EmptyThreshold = BeatsPerSecond;
+const unsigned long CanIdTemps = 0x360; // byte 2 oil, byte 3 coolant
+const unsigned long CanIdRpm = 0x140;   // bytes 2-3 RPM (14 bits)
+const int CanTempOffset = 40;           // °C = raw - 40
 const int RpmWindow = 8; // engine stopped when this many consecutive RPM packets are 0
 // duty steps and temperature thresholds: pump_control.h
 // lcd row 0
+const int PressureNowRow = 0; // current psi at PressureOffset, calibration mark at +3
 const int OilOffset = 6;
 const int OilRow = 0;
 const int CoolantOffset = 11;
@@ -103,6 +107,7 @@ const int PumpRow = 1;
 const int DipMarkOffset = 4; // oil pressure dip indicator
 const int DipMarkRow = 0;
 const int OPLogSize = 150; // 20 Hz (OPSampleMs) x 150 = ~7.5 sec
+const int OPLogRpmRange = 50; // max psi is taken within this many rpm of the logged max rpm
 // Oil pressure filter: oversampled ADC -> median (spike rejection) -> EMA (smoothing)
 const int OPOversample = 4;          // analogRead() calls averaged per sample
 const int OPMedianSize = 5;          // rejects up to 2 consecutive spikes
@@ -141,11 +146,9 @@ rgb_lcd lcd;
 MCP_CAN CAN(SPI_CS_PIN);                                    // Set CS pin
 
 // Configure the motor driver.
-CytronMD motor(PWM_DIR, 9, 4);  // PWM = Pin 9, DIR = Pin 4.
+CytronMD motor(PWM_DIR, MotorPwmPin, MotorDirPin);
 
-void timerFunc();
-
-int EmptyCnt = 0;
+bool CanResetRequested = false; // set by RequestCanReset(), handled by ResetCanIfRequested()
 int LcdUpdateCount = 0;
 #ifdef TEST
 int CurTemp = 70; //test
@@ -156,19 +159,14 @@ PumpState Pump;
 int RpmHistory[RpmWindow] = {0, };
 int RpmIndex = 0;
 int CurRPM = 0;
-int CurVolt;
 int OilTemp;
 bool IsEngineStopped = true;
 bool HasEngineStarted = false;
 bool HasRpmReceived = false;
 bool IsCANBusError = false;
 bool IsReadBegan = false;
-volatile bool ForceCanTimer = false;
-volatile int TimerCount = 0;
 int IndexDuty = MaxDutyIndex;
 unsigned int CANBusResetCount = 0;
-char MaskSet = '.';
-char FilterSet = '.';
 
 int IntervalCount = 0;
 bool RpmStop = false;
@@ -177,8 +175,6 @@ bool TempStop = false;
 int PrevTemp = -40;
 int PrevOil = -40;
 int PrevDuty = -1;
-int PrevVolt = -1;
-int PrevRpm = -1;
 unsigned int PrevRpmCnt = 0;
 unsigned int PrevTempCnt = 0;
 unsigned int RpmCnt = 0;
@@ -207,111 +203,34 @@ unsigned long OPLowSince = 0;
 unsigned long OPOkSince = 0;
 unsigned long BuzzerUntil = 0;
 
-volatile unsigned char flagRecv = 0;
-volatile unsigned char checkBus = 0;
-volatile unsigned char setPwm = 0;
-volatile unsigned char dispLcd = 0;
+volatile bool Tick = false; // set every MonitorInterval by MsTimer2
 
-void init_arrays()
+// Restricts reception to the two IDs used. Each register write is tried up to 3 times;
+// on failure the bus is flagged and CheckCount() schedules another reset.
+bool SetMaskFilt()
 {
-  memset(RpmHistory, 0, sizeof(RpmHistory));
-  memset(OilPressureLogs, 0, OPLogSize * sizeof(struct PressureLogT));
-  memset(OPVoltRaw, 0, OPMedianSize * sizeof(float));
-}
-
-void init_vars()
-{
-  EmptyCnt = 0;
-  RpmIndex = 0;
-  CurRPM = 0;
-  IsEngineStopped = true;
-  HasEngineStarted = false;
-  HasRpmReceived = false;
-  IsCANBusError = false;
-  IsReadBegan = false;
-  ForceCanTimer = false;
-  TimerCount = 0;
-  IndexDuty = MaxDutyIndex;
-  PumpReset(Pump);
-  CANBusResetCount = 0;
-  MaskSet = '.';
-  FilterSet = '.';
-
-  IntervalCount = 0;
-  RpmStop = false;
-  TempStop = false;
-
-  PrevTemp = -40;
-  PrevOil = -40;
-  PrevDuty = -1;
-  PrevVolt = -1;
-  PrevRpm = -1;
-  Heartbeat = 0;
-
-  OPLogHead = 0;
-  OPLogTail = 0;
-  VoltOffset = 0.0;
-  OPVoltIdx = 0;
-  OPVoltSamples = 0;
-  OPVoltEma = 0.0;
-  OPAlarm = OP_NORMAL;
-  OPDipCount = 0;
-  LastRpmMs = 0;
-  LastOPSampleMs = 0;
-  OPRunningSince = 0;
-  OPLowSince = 0;
-  OPOkSince = 0;
-  BuzzerUntil = 0;
-}
-
-void init_flags()
-{
-  flagRecv = 0;
-  checkBus = 0;
-  setPwm = 0;
-  dispLcd = 0;  
-}
-
-#define TRY(a, l)  \
-do {\
-  int retry = 0;\
-  while (MCP2515_OK != (a))\
-  {\
-    retry++;\
-    if (retry > 2)\
-    {\
-      IsCANBusError = true; MaskSet = '.'; FilterSet = '.';\
-      DBGLN("init failed " #a " " #l);\
-      return;\
-    }\
-  }\
-} while(0)
-
-void set_mask_filt()
-{
-  /*
-  * set mask
-  */
-  TRY(CAN.init_Mask(0, 0, 0x360), __LINE__);
-  MaskSet = 'a';
-  TRY(CAN.init_Mask(1, 0, 0x140), __LINE__);
-  MaskSet = 'b';
-  
-  /*
-  * set filter
-  */
-  TRY(CAN.init_Filt(0, 0, 0x360), __LINE__);
-  FilterSet = '0';
-  TRY(CAN.init_Filt(1, 0, 0x360), __LINE__);
-  FilterSet = '1';
-  TRY(CAN.init_Filt(2, 0, 0x360), __LINE__);
-  FilterSet = '2';
-  TRY(CAN.init_Filt(3, 0, 0x140), __LINE__);
-  FilterSet = '3';
-  TRY(CAN.init_Filt(4, 0, 0x140), __LINE__);
-  FilterSet = '4';
-  TRY(CAN.init_Filt(5, 0, 0x140), __LINE__);
-  FilterSet = '5';
+  struct Reg { bool mask; unsigned char num; unsigned long id; };
+  const Reg regs[] = {
+    {true, 0, CanIdTemps}, {true, 1, CanIdRpm},
+    {false, 0, CanIdTemps}, {false, 1, CanIdTemps}, {false, 2, CanIdTemps},
+    {false, 3, CanIdRpm}, {false, 4, CanIdRpm}, {false, 5, CanIdRpm},
+  };
+  for (unsigned int i = 0; i < sizeof(regs) / sizeof(regs[0]); ++i)
+  {
+    bool ok = false;
+    for (int retry = 0; retry < 3 && !ok; ++retry)
+    {
+      ok = MCP2515_OK == (regs[i].mask ? CAN.init_Mask(regs[i].num, 0, regs[i].id)
+                                       : CAN.init_Filt(regs[i].num, 0, regs[i].id));
+    }
+    if (!ok)
+    {
+      IsCANBusError = true;
+      DBG("init failed "); DBG(regs[i].mask ? "mask " : "filt "); DBGLN(regs[i].num);
+      return false;
+    }
+  }
+  return true;
 }
 
 void SetPumpDuty()
@@ -366,54 +285,41 @@ void SetMotorSpeed()
 
 void timerFunc()
 {
-  setPwm = 1;
-  dispLcd = 1;
-  checkBus = 1;
-  flagRecv = 1;
+  Tick = true;
 }
 
-/*void MCP2515_ISR()
+void SetBusError()
 {
-  flagRecv = 1;
-}*/
-
-void SetBusError(char c, int line)
-{
-  IsCANBusError = true; MaskSet = '.'; FilterSet = '.';
+  IsCANBusError = true;
   IsReadBegan = false;
 }
 
-void SetBusErrorRetry(char c, int line)
+// '?' over the values that stopped arriving (TempStop/RpmStop from CheckCount())
+void MarkCanLost()
 {
-  EmptyCnt = EmptyThreshold;
-  IsCANBusError = true; MaskSet = '.'; FilterSet = '.';
-  IsReadBegan = false;
-
-  if (c == 't' || c == 'x')
+  if (TempStop)
   {
     lcd.setCursor(OilOffset + 2, OilRow); lcd.print('?');
     lcd.setCursor(CoolantOffset + 2, CoolantRow); lcd.print('?');
   }
-  if (c == 'r' || c == 'x')
+  if (RpmStop)
   {
     lcd.setCursor(RpmOffset + 1, RpmRow); lcd.print('?');
   }
 }
 
-void SetBusSuccess(char c, int line)
+void RequestCanReset()
+{
+  CanResetRequested = true;
+  SetBusError();
+  MarkCanLost();
+}
+
+void SetBusSuccess()
 {
   IsCANBusError = false;
 }
 
-/*
-* Interrupt
-* PIN 3 INT 0 SCL OC0B(Timer 0)
-* PIN 2 INT 1 SDA
-* PIN 1 INT 3 TXD1
-* PIN 0 INT 2 RXD1
-* PIN 7 INT 4
-* attachInterrupt(digitalPinToInterrupt(<pin num>), ISR, FALLING)
- */
 void setup()
 {
   // full duty until the controller can decide otherwise (the driver constructor leaves PWM LOW)
@@ -427,28 +333,24 @@ void setup()
     digitalWrite(BuzzerPin, LOW);
   }
 
-  init_arrays();
-  init_vars();
-  init_flags();
+  PumpReset(Pump);
   
 #ifdef DEBUG
   Serial.begin(115200);
 #endif
   LcdInit();
 
-  //attachInterrupt(digitalPinToInterrupt(7), MCP2515_ISR, FALLING); // start interrupt
-
   // Do not block here: if the MCP2515 fails, the control loop still runs (fail-safe 100%,
-  // oil pressure monitoring) and CheckCount()/CheckEmpty() retry the init every second.
+  // oil pressure monitoring) and CheckCount()/ResetCanIfRequested() retry the init every second.
   if (CAN_OK == CAN.begin(CAN_500KBPS))    // init can bus : baudrate = 500k
   {
     DBGLN("CANBus initialized");
-    SetBusSuccess('S', __LINE__);
+    SetBusSuccess();
   }
   else
   {
     DBGLN("CANBus init failed");
-    SetBusError('E', __LINE__);
+    SetBusError();
   }
 
   MsTimer2::set(MonitorInterval, timerFunc);
@@ -459,23 +361,14 @@ void loop()
 {
   taskCanRecv();
   SampleOilPressure();
-  if (flagRecv)
+  if (Tick)
   {
-    flagRecv = 0;
+    Tick = false;
     CheckCount();
-    CheckEmpty();
+    ResetCanIfRequested();
     CheckEngineStop();
-  }
-
-  if (setPwm)
-  {
-    setPwm = 0;
     SetPumpDuty();
     SetMotorSpeed();
-  }
-  if (dispLcd)
-  {
-    dispLcd = 0;
     Display();
   }
 }
@@ -675,74 +568,21 @@ int GetCurrentOP()
   return OilPressureLogs[(OPLogTail + OPLogSize - 1) % OPLogSize].psi;
 }
 
-int GetMaxRpm()
-{
-  int maxRpm = 0;
-  if (OPLogHead < OPLogTail)
-  {
-    for (int i = OPLogHead; i < OPLogTail; ++i)
-    {
-      if (maxRpm < OilPressureLogs[i].rpm)
-      {
-        maxRpm = OilPressureLogs[i].rpm;
-      }
-    }
-  }
-  else if (OPLogTail < OPLogHead)
-  {
-    for (int i = OPLogHead; i < OPLogSize; ++i)
-    {
-      if (maxRpm < OilPressureLogs[i].rpm)
-      {
-        maxRpm = OilPressureLogs[i].rpm;
-      }
-    }
-    for (int i = 0; i < OPLogTail; ++i)
-    {
-      if (maxRpm < OilPressureLogs[i].rpm)
-      {
-        maxRpm = OilPressureLogs[i].rpm;
-      }
-    }
-  }
-  return maxRpm;
-}
-
+// max rpm in the log and the max psi within OPLogRpmRange of it -> OPToDisp
 void GetMaxRecentOPLog()
 {
-  const int range = 50;
-  int maxRpm = GetMaxRpm();
+  int maxRpm = 0;
   int psiAtMaxRpm = 0;
-  if (OPLogHead < OPLogTail)
+  for (int i = OPLogHead; i != OPLogTail; i = (i + 1) % OPLogSize)
   {
-    for (int i = OPLogHead; i < OPLogTail; ++i)
-    {
-      if (maxRpm - range < OilPressureLogs[i].rpm && psiAtMaxRpm < OilPressureLogs[i].psi)
-      {
-        psiAtMaxRpm = OilPressureLogs[i].psi;
-      }
-    }
+    if (maxRpm < OilPressureLogs[i].rpm) { maxRpm = OilPressureLogs[i].rpm; }
   }
-  else if (OPLogTail < OPLogHead)
+  for (int i = OPLogHead; i != OPLogTail; i = (i + 1) % OPLogSize)
   {
-    for (int i = OPLogHead; i < OPLogSize; ++i)
+    if (maxRpm - OPLogRpmRange < OilPressureLogs[i].rpm && psiAtMaxRpm < OilPressureLogs[i].psi)
     {
-      if (maxRpm - range < OilPressureLogs[i].rpm && psiAtMaxRpm < OilPressureLogs[i].psi)
-      {
-        psiAtMaxRpm = OilPressureLogs[i].psi;
-      }
+      psiAtMaxRpm = OilPressureLogs[i].psi;
     }
-    for (int i = 0; i < OPLogTail; ++i)
-    {
-      if (maxRpm - range < OilPressureLogs[i].rpm && psiAtMaxRpm < OilPressureLogs[i].psi)
-      {
-        psiAtMaxRpm = OilPressureLogs[i].psi;
-      }
-    }
-  }
-  else
-  {
-    DBG4LN("maxOP h==t");
   }
   OPToDisp.rpm = maxRpm;
   OPToDisp.psi = psiAtMaxRpm;
@@ -753,34 +593,33 @@ void CheckCount()
   IntervalCount++;
   if (IntervalCount >= BeatsPerSecond) // 1 seconds
   {
-    char c = 'x';
     IntervalCount = 0;
     RpmStop = (PrevRpmCnt == RpmCnt) ? true : false;
     TempStop = (PrevTempCnt == TempCnt) ? true : false;
     PrevRpmCnt = RpmCnt;
     PrevTempCnt = TempCnt;
-    if (!RpmStop) { c = 't'; }
-    if (!TempStop) { c = 'r'; }
     if (RpmStop || TempStop)
     {
-      SetBusErrorRetry(c, __LINE__);
+      RequestCanReset();
     }
     else
     {
-      SetBusSuccess('s', __LINE__);
+      SetBusSuccess();
     }
   }
 }
 
-void CheckEmpty()
+// Re-initializes the MCP2515 after CheckCount() saw no packets for a second.
+// Never blocks, so oil pressure sampling and the pump control keep running.
+void ResetCanIfRequested()
 {
 #ifdef TEST
   static unsigned char dir = 0;
   static char step = 0;
 #endif
-  if (EmptyCnt >= EmptyThreshold)
+  if (CanResetRequested)
   {
-    EmptyCnt = 0;
+    CanResetRequested = false;
 #ifdef TEST
     if (dir == 0)
       CurTemp += 5;
@@ -818,19 +657,14 @@ void CheckEmpty()
       dir = 0;
     DBG("dir = "); DBGLN(dir);
 #else
-    SetBusError('R', __LINE__);
+    SetBusError();
     DBGLN("CANBus error!");
 
     CANBusResetCount++;
-    if (CAN_OK != CAN.begin(CAN_500KBPS))    // init can bus : baudrate = 500k
-    {
-      SetBusError('e', __LINE__);
-      delay(100);
-    }
-    else
+    if (CAN_OK == CAN.begin(CAN_500KBPS))    // init can bus : baudrate = 500k
     {
       DBGLN("CANBus initialized");
-      set_mask_filt();
+      SetMaskFilt();
     }
 #endif
   }
@@ -839,10 +673,8 @@ void CheckEmpty()
 void taskCanRecv()
 {
   unsigned char len = 0;
-  unsigned char buf[128];
+  unsigned char buf[MAX_CHAR_IN_MESSAGE];
   unsigned long canId;
-  unsigned char svc;
-  unsigned char pid;
 
   if(CAN_MSGAVAIL == CAN.checkReceive())                   // check if get data
   {
@@ -850,12 +682,12 @@ void taskCanRecv()
     canId = CAN.getCanId();
     DBG2H(canId); DBG2(","); DBG2(len); DBG2(":");
     DBG2H(buf[0]); DBG2(" "); DBG2H(buf[1]); DBG2(" "); DBG2H(buf[2]); DBG2(" "); DBG2H(buf[3]); DBG2LN("");
-    if (canId == 0x360)
+    if (canId == CanIdTemps && len >= 4)
     {
       TempCnt++;
       // 2 byte OilTemp, 3 byte CoolantTemp
-      CurTemp = buf[3] - 40;
-      OilTemp = buf[2] - 40;
+      CurTemp = buf[3] - CanTempOffset;
+      OilTemp = buf[2] - CanTempOffset;
       DBG("Water "); DBG(CurTemp); DBG(" Oil "); DBGLN(OilTemp);
       if (!IsReadBegan)
       {
@@ -863,7 +695,7 @@ void taskCanRecv()
         DBGLN("Read began!");
       }
     }
-    else if (canId == 0x140)
+    else if (canId == CanIdRpm && len >= 4)
     {
       RpmCnt++;
       HasRpmReceived = true;
@@ -907,14 +739,11 @@ void LcdInit()
 
 void Display()
 {
-  const char dig[16][8] = {"   0", "1.56", "3.13", "6.25", "12.5", "  25", "37.5","  50", "62.5", "  75", "87.5", " 100"};
+  const char dig[MaxDutyIndex + 1][5] = {"   0", "1.56", "3.13", "6.25", "12.5", "  25", "37.5", "  50", "62.5", "  75", "87.5", " 100"};
   bool perSecond = false;
   //           0123456789012345
-  //lcd.print("--.-V Pump     %");
-  //lcd.print("O    °C Wt    °C");
-  //lcd.print("R ---- Pmp     %");
-  //lcd.print("---  O--- W---°C");
-  //lcd.print("---psi@-- P    %");
+  //row 0:    "---  O--- W---°C"
+  //row 1:    "---psi@-- P    %"
 
   if (++LcdUpdateCount >= BeatsPerSecond)
   {
@@ -928,43 +757,12 @@ void Display()
 #ifndef TEST
   if (IsCANBusError || !IsReadBegan)
   {
-    if (TempStop)
+    MarkCanLost();
+    if (IsCANBusError)
     {
-      lcd.setCursor(OilOffset + 2, OilRow); lcd.print('?');
-      lcd.setCursor(CoolantOffset + 2, CoolantRow); lcd.print('?');
-    }
-    if (RpmStop)
-    {
-      lcd.setCursor(RpmOffset + 1, RpmRow); lcd.print('?');
-    }
-    /*PrevTemp = -40;
-    PrevOil = -40;
-    PrevDuty = -1;
-    PrevVolt = -1;
-    PrevRpm = -1;*/
-    if (!IsCANBusError && !IsReadBegan)
-    {
-      /*lcd.setCursor(3, 0);
-      lcd.print(MaskSet);
-      lcd.setCursor(4, 0);
-      lcd.print(FilterSet);*/
-    }
-    else if (IsCANBusError)
-    {
-      /*lcd.setCursor(OilOffset, OilRow);
-      lcd.print("---");
-      lcd.setCursor(CoolantOffset, CoolantRow);
-      lcd.print("---");*/
+      const char spinner[4] = {'-', '/', '-', '\\'};
       lcd.setCursor(ResetOffset, ResetRow);
-      int pos = CANBusResetCount % 4;
-      switch (pos)
-      {
-        case 0: lcd.print("-"); break;
-        case 1: lcd.print("/"); break;
-        case 2: lcd.print("-"); break;
-        case 3: lcd.print("\\"); break;
-        default: break;
-      }
+      lcd.print(spinner[CANBusResetCount % 4]);
     }
   }
   else
@@ -976,11 +774,6 @@ void Display()
     {
       DispOilPressure();
     }
-    /*if (PrevRpm != CurRPM)
-    {
-      PrevRpm = CurRPM;
-      DispRpm(PrevRpm, RpmOffset, 1);
-    }*/
     if (PrevTemp != CurTemp)
     {
       PrevTemp = CurTemp;
@@ -991,11 +784,6 @@ void Display()
       PrevOil = OilTemp;
       DispTemp(PrevOil, OilOffset, OilRow);
     }
-    /*if (PrevVolt != CurVolt)
-    {
-      PrevVolt = CurVolt;
-      DispVolt(PrevVolt, 0, 1);
-    }*/
   }
 
   // shown regardless of CAN state; oil pressure is sampled independently
@@ -1004,14 +792,14 @@ void Display()
   if (PrevDuty != IndexDuty)
   {
     PrevDuty = IndexDuty;
-    DBG1("idx "); DBG1(PrevDuty); DBG1(" duty "); DBG1LN(dig[PrevDuty]);
-    lcd.setCursor(PumpOffset, 1);
+    lcd.setCursor(PumpOffset, PumpRow);
     if (PrevDuty < 0 || MaxDutyIndex < PrevDuty)
     {
       lcd.print("err");
     }
     else
     {
+      DBG1("idx "); DBG1(PrevDuty); DBG1(" duty "); DBG1LN(dig[PrevDuty]);
       lcd.print(dig[PrevDuty]);
     }
   }
@@ -1035,10 +823,10 @@ void DispOilPressure()
   //           0123456789012345
   //lcd.print("---psi@-- P    %");
   // current oil pressure
-  lcd.setCursor(PressureOffset, 0);
+  lcd.setCursor(PressureOffset, PressureNowRow);
   if (OPAlarm == OP_SENSOR_FAULT) { lcd.print("---"); }
   else { DispPsi(cur); }
-  lcd.setCursor(PressureOffset + 3, 0);
+  lcd.setCursor(PressureOffset + 3, PressureNowRow);
   if (VoltOffset == 0.0) { lcd.print(' '); }
   else if (VoltOffset < 0.1) { lcd.print('_'); }
   else if (VoltOffset < 0.3) { lcd.print('+'); }
@@ -1118,22 +906,6 @@ void DispOilWarning()
   shown = OPAlarm;
 }
 
-/*void DispRpm(int rpm, int col, int row)
-{
-  int base = rpm / 50;
-  rpm = base * 50 + (rpm - base >= 25 ? 50 : 0);
-  lcd.setCursor(col, row);
-  if (rpm < 0 || rpm > 9000)
-  {
-    lcd.print("err");
-    return;
-  }
-  if (rpm < 10) { lcd.print("   "); }
-  else if (rpm < 100) { lcd.print("  "); }
-  else if (rpm < 1000) { lcd.print(" "); }
-  lcd.print(rpm);
-}*/
-
 void DispTemp(int temp, int col, int row)
 {
   lcd.setCursor(col, row);
@@ -1145,16 +917,4 @@ void DispTemp(int temp, int col, int row)
   lcd.print(temp);
 }
 
-/*void DispVolt(int volt, int col, int row)
-{
-  lcd.setCursor(col, row);
-  if (volt < 10)
-  {
-    lcd.print(" ");
-    lcd.print(volt / 10);
-  }
-  else { lcd.print(volt / 10); }
-  lcd.print(".");
-  lcd.print(volt % 10);  
-}*/
 // END FILE

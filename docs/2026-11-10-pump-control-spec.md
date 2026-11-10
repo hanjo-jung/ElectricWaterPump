@@ -28,7 +28,7 @@
 | D2/D3 | I2C (LCD) | – | Grove 16x2 LCD |
 | D8 (권장) | 부저 | 출력 | 기본 비활성 (`BuzzerPin = -1`), HIGH = 울림 |
 
-- 타이머: MsTimer2가 timer4를 쓰고 100ms마다 제어·표시·CAN 점검 플래그를 세운다. 실제 처리는 `loop()`에서 한다.
+- 타이머: MsTimer2가 timer4를 쓰고 100ms마다 `Tick` 플래그를 세운다. 실제 처리는 `loop()`에서 버스 감시 → CAN 재초기화 → 엔진 정지 판정 → 듀티 결정·출력 → 표시 순으로 한다.
 - 부저는 차량 12V 능동형 피에조를 NPN 트랜지스터로 구동하는 구성을 권장한다(상세는 [2026-11-09-oil-pressure.md](2026-11-09-oil-pressure.md)).
 
 ## 센서 입력 처리
@@ -43,10 +43,10 @@
 | 0x360 | 3 | 냉각수 온도 `CurTemp` | `buf[3] - 40` °C |
 | 0x140 | 2–3 | 엔진 RPM `CurRPM` | `((buf[3] & 0x3F) << 8) + buf[2]` |
 
-- 마스크 2개와 필터 6개로 0x360, 0x140만 받는다.
+- 마스크 2개와 필터 6개로 0x360, 0x140만 받는다(`CanIdTemps`, `CanIdRpm`). 데이터가 4바이트 미만인 프레임은 무시한다.
 - 0x360을 처음 받으면 `IsReadBegan = true`. 0x140을 받으면 `HasRpmReceived = true`, RPM이 0보다 크면 `HasEngineStarted = true`.
 - 엔진 정지: 최근 RPM 패킷 8개(`RpmWindow`)가 모두 0이면 `IsEngineStopped = true`. `HasEngineStarted`는 리셋 전까지 유지된다.
-- 버스 감시(1초 주기): 온도 또는 RPM 패킷 수가 늘지 않으면 `IsCANBusError = true`, `IsReadBegan = false`로 두고 `CAN.begin()`과 마스크·필터를 다시 설정한다. LCD에는 해당 값 자리에 `?`와 리셋 횟수 스피너를 표시한다.
+- 버스 감시(1초 주기): 온도 또는 RPM 패킷 수가 늘지 않으면 `IsCANBusError = true`, `IsReadBegan = false`로 두고 `CAN.begin()`과 마스크·필터를 다시 설정한다. 재초기화는 블로킹 지연 없이 하므로 그동안에도 유압 샘플링과 펌프 제어가 계속된다. LCD에는 해당 값 자리에 `?`와 리셋 횟수 스피너를 표시한다.
 
 ### 유압 센서 (A0, 50ms 주기)
 
