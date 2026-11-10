@@ -5,6 +5,7 @@
 #include <MsTimer2.h>
 #include <Wire.h>
 #include <rgb_lcd.h>
+#include "pump_control.h"
 
 //#define NO_CAN
 //#define TEST
@@ -80,16 +81,9 @@ const int OnPin = 12;
 const int OilPressurePin = A0;
 const int MonitorInterval = 100; // ms
 const int BeatsPerSecond = 1000 / MonitorInterval;
-const int MonitorWindow = 10;
 const int EmptyThreshold = BeatsPerSecond;
-const int MaxDutyIndex = 11;
-const int Duties[12] = {0, 4, 8, 16, 32, 64, 96, 128, 160, 192, 224, 255};
-const int WarmUpTemp = 80;
-const int LowTemp = 88;
-const int TargetTemp = 92;
-const int MidTemp = 95;
-const int HighTemp = 98;
-const int MaxTemp = 99;
+const int RpmWindow = 8; // engine stopped when this many consecutive RPM packets are 0
+// duty steps and temperature thresholds: pump_control.h
 // lcd row 0
 const int OilOffset = 6;
 const int OilRow = 0;
@@ -153,19 +147,13 @@ void timerFunc();
 
 int EmptyCnt = 0;
 int LcdUpdateCount = 0;
-// Temp1sec/Diff1sec/Accu1sec: one entry per SetPumpDuty() tick (MonitorInterval = 100 ms),
-// 10 entries used, so the window spans 1 second (not one entry per second).
-int Diff1sec[16];
-int Accu1sec[16];
-int TempIndex = 0;
 #ifdef TEST
-int Temp1sec[16] = {70,70,70,70,70,70,70,70,70,70,};
 int CurTemp = 70; //test
 #else
-int Temp1sec[16];
 int CurTemp;
 #endif
-int RpmHistory[16] = {0, };
+PumpState Pump;
+int RpmHistory[RpmWindow] = {0, };
 int RpmIndex = 0;
 int CurRPM = 0;
 int CurVolt;
@@ -173,14 +161,10 @@ int OilTemp;
 bool IsEngineStopped = true;
 bool HasEngineStarted = false;
 bool HasRpmReceived = false;
-bool IsWarmedUp = false;
-bool IsHighReached = false;
-bool IsOilHot = false;
 bool IsCANBusError = false;
 bool IsReadBegan = false;
 volatile bool ForceCanTimer = false;
 volatile int TimerCount = 0;
-int WarmUpCnt = 0;
 int IndexDuty = MaxDutyIndex;
 unsigned int CANBusResetCount = 0;
 char MaskSet = '.';
@@ -230,15 +214,7 @@ volatile unsigned char dispLcd = 0;
 
 void init_arrays()
 {
-  int i;
-  for (i = 0; i < 16; ++i)
-  {
-    Diff1sec[i] = 0;
-#ifndef TEST
-    Temp1sec[i] = 0;
-#endif
-    RpmHistory[i] = 0;
-  }
+  memset(RpmHistory, 0, sizeof(RpmHistory));
   memset(OilPressureLogs, 0, OPLogSize * sizeof(struct PressureLogT));
   memset(OPVoltRaw, 0, OPMedianSize * sizeof(float));
 }
@@ -246,21 +222,17 @@ void init_arrays()
 void init_vars()
 {
   EmptyCnt = 0;
-  TempIndex = 0;
   RpmIndex = 0;
   CurRPM = 0;
   IsEngineStopped = true;
   HasEngineStarted = false;
   HasRpmReceived = false;
-  IsWarmedUp = false;
-  IsHighReached = false;
-  IsOilHot = false;
   IsCANBusError = false;
   IsReadBegan = false;
   ForceCanTimer = false;
   TimerCount = 0;
-  WarmUpCnt = 0;
   IndexDuty = MaxDutyIndex;
+  PumpReset(Pump);
   CANBusResetCount = 0;
   MaskSet = '.';
   FilterSet = '.';
@@ -342,211 +314,27 @@ void set_mask_filt()
   FilterSet = '5';
 }
 
-int SumOfDifferentials()
-{
-  const unsigned char idx[21] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0,};
-  int i;
-  int sum = 0;
-  bool monoInc = true;
-  bool monoDec = true;
-  for (i = 0; i < 10; ++i)
-  {
-    int d = Diff1sec[idx[TempIndex + i]];
-    if (d < 0) monoInc = false;
-    else if (d > 0) monoDec = false;
-    sum += d;
-  }
-  DBG1(" ("); DBG1(monoInc); DBG1(monoDec); DBG1(" delta "); DBG1(sum); DBG1(") ");
-  if (monoInc || monoDec)
-  {
-    return sum;
-  }
-  return 0;
-}
-
-int SumOfDelta()
-{
-  const unsigned char idx[21] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0,};
-  int i;
-  int accu = 0;
-  for (i = 0; i < 10; ++i)
-  {
-    int d = Accu1sec[idx[TempIndex + i]];
-    accu += d;
-  }
-  DBG1("("); DBG1("accu "); DBG1(accu); DBG1(") ");
-  return accu;
-}
-
-int Trim16(int value)
-{
-  return (value < 0) ? 0 : ((value > 15) ? 15: value);
-}
-
 void SetPumpDuty()
 {
-  const unsigned char nextIdx[16] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 0, 1, 2, 3, 4, 5, 6};
-  const unsigned char prevIdx[16] = {9, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0, 1, 2, 3, 4};
-  int diverge;
-  int defaultDutyIdx;
-  bool pumpOn = digitalRead(OnPin) == LOW;
-  /*
-   * IsCANBusError IsReadBegan HasEngineStarted
-   *       F           F             F         while ECU reflashing possibly
-   *       T           F             F         while ECU reflashing possibly
-   *       F           T             F         before cranking (key on); treat as normal to check pump
-   *       T           T             F         hardly
-   *       F           F             T         error; after this water pump controller reset, temp not yet received
-   *       T           F             T         error
-   *       F           T             T         normal
-   *       T           T             T         hardly
-   *
-   * Before the engine has started, a CAN error also means fail-safe: otherwise a bus
-   * lost after the first RPM packet would keep the key-on 0% duty, and since no RPM
-   * arrives HasEngineStarted would never be set even after the engine is cranked.
-   */
-  if (pumpOn || (!IsReadBegan && HasEngineStarted) ||
-      (!HasEngineStarted && (!HasRpmReceived || IsCANBusError)))
-  {
-    if (IndexDuty < MaxDutyIndex)
-      IndexDuty += 2;
-    if (IndexDuty <= 0 || MaxDutyIndex < IndexDuty)
-      IndexDuty = MaxDutyIndex;
-    DBG("Error ");
-    DBGLN(IndexDuty);
-  }
-  // there is a possibility that RPM packets are not received for a while after engine started.
-  else if ((!IsReadBegan || (IsReadBegan && CurTemp < HighTemp)) && (!HasEngineStarted && HasRpmReceived))
-  {
-    IndexDuty = 0;
-    DBG("Key On");
-    DBGLN(IndexDuty);
-  }
-  else
-  {
-    const unsigned char log10val[16] = {0, 3, 4, 5, 6, 7, 8, 8, 
-                                        8, 8, 8, 8, 8, 8, 8, 8};
-    int diff;
-    int accu;
-#ifdef TEST
-    {
-      int i;
-      for (i = 0; i < MonitorWindow; i++) { DBG1(Temp1sec[i]); DBG1(" "); } DBG1LN(TempIndex);
-      for (i = 0; i < MonitorWindow; i++) { DBG1(Diff1sec[i]); DBG1(" "); } DBG1LN(TempIndex);
-    }
-#endif
-    if (TempIndex < 0 || 10 <= TempIndex)
-    {
-      TempIndex = 0;
-    }
-    Temp1sec[TempIndex] = CurTemp;
-    Diff1sec[TempIndex] = CurTemp - Temp1sec[prevIdx[TempIndex]];
-    diverge = CurTemp - TargetTemp;
-    Accu1sec[TempIndex] = diverge;
-    diverge = Trim16(diverge);
-    defaultDutyIdx = 4 + log10val[diverge];
-    DBG1(TempIndex); DBG1(", "); DBG1(CurTemp); DBG1(" D"); DBG1(diverge); DBG1(", ");
-    TempIndex = nextIdx[TempIndex];
-
-    DBG1(defaultDutyIdx); DBG1("->");
-    diff = SumOfDifferentials();
-    accu = SumOfDelta();
-
-    if (CurTemp >= HighTemp)
-      IsHighReached = true;
-    else if (CurTemp < MidTemp && diff <= 0)
-      IsHighReached = false; 
-
-    if (OilTemp >= 103)
-      IsOilHot = true;
-    else if (OilTemp <= 100)
-    {
-      IsOilHot = false;
-    }
-
-    if (CurTemp >= WarmUpTemp)
-      IsWarmedUp = true;
-
-    if (CurTemp < LowTemp) // Low=88, WarmUp=80
-    {
-      if (IsReadBegan && !IsEngineStopped)
-      {
-        WarmUpCnt++;
-        // pulse 1 second per 5 seconds (WarmUpCnt counts 100 ms ticks)
-        // 1..40  (4 s) -> 1 to warm up coolant
-        // 41..50 (1 s) -> 5 to circulate coolant
-        if (WarmUpCnt > 40)
-        {
-          IndexDuty = 5; // 25%
-          if (WarmUpCnt >= 50)
-            WarmUpCnt = 0;
-        }
-        else
-        {
-          IndexDuty = 1; // 1.56% (4/255)
-        }
-      }
-    }
-    else if (CurTemp >= MaxTemp || IsOilHot || IsHighReached)
-    {
-      IndexDuty = MaxDutyIndex;
-    }
-    else
-    {
-      int delta;
-      int bonus = Trim16(CurTemp - (TargetTemp - 2));
-
-      if (CurTemp < TargetTemp)
-      {
-        if (diff < 0) delta = -3;
-        else if (diff == 0)
-        {
-          // keep below the TargetTemp steady case (+2) so duty rises with temperature:
-          // steady 90 -> 12.5%, 91 -> 25%, 92 -> 37.5%
-          if (accu >= -10)
-            delta = 1;
-          else if (accu >= -20)
-            delta = 0;
-          else
-            delta = -1;
-        }
-        else delta = (accu > -20) ? log10val[bonus] : 0;
-      }
-      else if (CurTemp == TargetTemp)
-      {
-        if (diff < 0) delta = 0;
-        else if (diff == 0) delta = (accu >= 0) ? 2 : 0;
-        else delta = (accu > -10) ? (10 + accu) : 4;
-      }
-      else
-      {
-        if (diff < 0) delta = diverge;
-        else if(diff == 0) delta = log10val[diverge];
-        else delta = log10val[bonus];
-      }
-
-      if (delta < -3) delta = -3; // to avoid IndexDuty == 0 case
-
-      IndexDuty = defaultDutyIdx + delta;
-    }
-   
-    if (OilTemp >= 98)
-    {
-      IndexDuty += OilTemp - 98;
-    }
-
-    if (IndexDuty <= 0 || IndexDuty > MaxDutyIndex)
-      IndexDuty = MaxDutyIndex;
-
-    DBG1LN(IndexDuty);
-  }
+  PumpInputs in;
+  in.forceOn = digitalRead(OnPin) == LOW;
+  in.tempValid = IsReadBegan;
+  in.rpmReceived = HasRpmReceived;
+  in.canError = IsCANBusError;
+  in.engineStarted = HasEngineStarted;
+  in.engineStopped = IsEngineStopped;
+  in.coolant = CurTemp;
+  in.oil = OilTemp;
+  IndexDuty = PumpComputeIndex(in, Pump);
+  DBG1(CurTemp); DBG1(" diff "); DBG1(PumpRate(Pump)); DBG1(" accu "); DBG1(PumpAccumulated(Pump));
+  DBG1(" -> "); DBG1LN(IndexDuty);
 }
 
 void CheckEngineStop()
 {
 #ifndef TEST
   bool allZero = true;
-  for (int i = 0; i < 8; ++i)
+  for (int i = 0; i < RpmWindow; ++i)
   {
     if (RpmHistory[i] > 0)
     {
@@ -1080,24 +868,14 @@ void taskCanRecv()
       RpmCnt++;
       HasRpmReceived = true;
       LastRpmMs = millis();
-      if (RpmIndex < 0 || 10 <= RpmIndex)
-      {
-        RpmIndex = 0;
-      }
-      if (0 <= RpmIndex && RpmIndex < 10)
-      {
-        RpmHistory[RpmIndex] = CurRPM;
-      }
-      if (++RpmIndex >= 10)
-      {
-        RpmIndex = 0;
-      }
       /*
       Get data from ID: 140
       0  4 0 40  0 0 60  1 
       */
       // 0 byte AccelPedalPositionA, 1 byte Flags (8 bit clutch), 2 long RPM, 4 byte AccelPedalPositionB, 5 byte AccelPedalPositionC, ?
       CurRPM = (((buf[3] & 0x3f) << 8) + buf[2]);
+      RpmHistory[RpmIndex] = CurRPM;
+      RpmIndex = (RpmIndex + 1) % RpmWindow;
       if (CurRPM > 0)
       {
         IsEngineStopped = false;

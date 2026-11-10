@@ -9,7 +9,7 @@
 - 대상 MCU: Arduino Leonardo 호환 CAN 보드(Longan Labs, MCP2515)
 - 구동: Cytron MD10C 모터 드라이버
 - 표시: Grove 16x2 I2C LCD, 선택 사항으로 능동 부저
-- 근거 자료: [README.md](../README.md), [EWPController.ino](../EWPController/EWPController.ino), [2026-11-09-oil-pressure.md](2026-11-09-oil-pressure.md) (브랜치 `oil-pressure-median-filter`)
+- 근거 자료: [README.md](../README.md), [EWPController.ino](../EWPController/EWPController.ino), [pump_control.cpp](../EWPController/pump_control.cpp), [test_pump_control.cpp](../test/test_pump_control.cpp), [2026-11-09-oil-pressure.md](2026-11-09-oil-pressure.md) (브랜치 `oil-pressure-median-filter`)
 
 유압 필터와 유압 상실 경고는 `oil-pressure-median-filter` 브랜치에만 있고 main 미머지, 실차 미검증 상태다.
 
@@ -45,7 +45,7 @@
 
 - 마스크 2개와 필터 6개로 0x360, 0x140만 받는다.
 - 0x360을 처음 받으면 `IsReadBegan = true`. 0x140을 받으면 `HasRpmReceived = true`, RPM이 0보다 크면 `HasEngineStarted = true`.
-- 엔진 정지: 최근 RPM 이력 8개가 모두 0이면 `IsEngineStopped = true`. `HasEngineStarted`는 리셋 전까지 유지된다.
+- 엔진 정지: 최근 RPM 패킷 8개(`RpmWindow`)가 모두 0이면 `IsEngineStopped = true`. `HasEngineStarted`는 리셋 전까지 유지된다.
 - 버스 감시(1초 주기): 온도 또는 RPM 패킷 수가 늘지 않으면 `IsCANBusError = true`, `IsReadBegan = false`로 두고 `CAN.begin()`과 마스크·필터를 다시 설정한다. LCD에는 해당 값 자리에 `?`와 리셋 횟수 스피너를 표시한다.
 
 ### 유압 센서 (A0, 50ms 주기)
@@ -67,7 +67,7 @@ P_{psi} = (V + V_{offset} - 0.5) \cdot \frac{145}{4}
 
 ## 펌프 제어 로직
 
-`SetPumpDuty()`는 100ms마다 12단계 듀티 중 하나(`IndexDuty`)를 고르고, `SetMotorSpeed()`는 값이 바뀔 때만 MD10C에 출력한다. 상태를 판단할 수 없거나 계산 결과가 범위를 벗어나면 항상 100%로 간다.
+`SetPumpDuty()`는 100ms마다 입력을 모아 `PumpComputeIndex()`([pump_control.cpp](../EWPController/pump_control.cpp))로 12단계 듀티 중 하나(`IndexDuty`)를 고르고, `SetMotorSpeed()`는 값이 바뀔 때만 MD10C에 출력한다. 상태를 판단할 수 없거나 계산 결과가 범위를 벗어나면 항상 100%로 간다.
 
 ```mermaid
 flowchart TD
@@ -116,9 +116,9 @@ flowchart TD
 
 ### 모드별 동작
 
-- **페일세이프**: 비상 스위치가 LOW이거나, 시동 후 온도를 못 받거나(CAN 오류 포함), 시동 전 RPM을 한 번도 못 받았거나 CAN 오류(`IsCANBusError`)이면 100ms마다 2단계씩 올려 11에 도달한다. 현재 단계가 0이면 곧바로 11이 된다. 전원 투입 직후에도 이 상태로 시작하며, `setup()` 첫 줄에서 100%를 출력해 초기화 중에도 펌프가 돈다.
+- **페일세이프**: 비상 스위치가 LOW이거나, 시동 후 온도를 못 받거나(CAN 오류 포함), 시동 전 RPM을 한 번도 못 받았거나 CAN 오류(`IsCANBusError`)이면 100ms마다 2단계씩 올려 11에 도달한다. 키 온 대기(0)에서 넘어오면 2, 4, …, 10, 11로 0.6초 동안 올라간다. 전원 투입 직후에도 이 상태로 시작하며, `setup()` 첫 줄에서 100%를 출력해 초기화 중에도 펌프가 돈다.
 - **키 온 대기**: 시동 전이고 RPM을 받고 있으며 CAN 오류가 없고, 수온을 아직 못 받았거나 98°C 미만이면 0%. 수온이 98°C 이상이면 시동 전이라도 정상 제어로 냉각한다.
-- **워밍업 (수온 < 88°C)**: 엔진이 돌고 있으면 5초 주기로 4초는 1단계(1.56%), 1초는 5단계(25%)로 구동해 냉각수를 섞는다. 엔진 정지 중에는 직전 단계를 유지한다.
+- **워밍업 (수온 < 88°C)**: 엔진이 돌고 있으면 5초 주기로 4초는 1단계(1.56%), 1초는 5단계(25%)로 구동해 냉각수를 섞는다. 엔진 정지 중에는 직전 단계를 유지한다(오일 보정은 유지한 단계에 한 번만 더한다).
 - **최대 냉각**: 수온 ≥ 99°C, 고온 래치(98°C에서 설정, 95°C 미만이고 상승 중이 아니면 해제), 오일 고온 래치(103°C 설정, 100°C 이하 해제) 중 하나면 100%.
 - **구간 제어 (88–97°C)**: 기본 단계에 보정값을 더한다(아래).
 - **오일 보정과 범위 확인**: 정상 제어의 모든 결과에 오일 온도 ≥ 98°C이면 (오일 − 98)단계를 더한다. 결과가 0 이하이거나 11을 넘으면 11(100%)로 둔다.
@@ -130,6 +130,7 @@ flowchart TD
 - 기본 단계 = 4 + f(T − 92): T ≤ 92이면 4(12.5%), 93이면 7, 94이면 8, 95이면 9, 96이면 10, 97이면 11.
 - diff: 최근 10틱(1초)의 수온 변화 합. 단조 증가나 단조 감소일 때만 값을 갖고, 오르내리면 0.
 - accu: 최근 10틱의 (T − 92) 합.
+- 이력은 모드와 관계없이 온도를 받는 동안 매 틱 쌓는다(키 온 대기·페일세이프 포함). 온도가 끊겼다가 다시 들어오면 첫 샘플로 10칸을 채워 "일정했던 것"으로 시작한다.
 
 | 수온 | 하강 (diff < 0) | 정체 (diff = 0) | 상승 (diff > 0) |
 | --- | --- | --- | --- |
@@ -208,7 +209,7 @@ row 1:    mmmpsi@rr Pdddd%
 
 ## 설정 파라미터
 
-모든 값은 `EWPController.ino` 상단의 `const`이며, 바꾸려면 다시 빌드해야 한다.
+펌프 제어 값은 `pump_control.h`, 나머지는 `EWPController.ino` 상단의 `const`이며, 바꾸려면 다시 빌드해야 한다. 제어 로직을 바꾸면 PC에서 `test/test_pump_control.cpp`를 돌린다(빌드 명령은 파일 첫 줄).
 
 | 상수 | 값 | 단위 | 의미 |
 | --- | --- | --- | --- |
@@ -218,9 +219,12 @@ row 1:    mmmpsi@rr Pdddd%
 | `MidTemp` | 95 | °C | 고온 래치 해제 온도 |
 | `HighTemp` | 98 | °C | 고온 래치 설정, 키 온 대기 상한 |
 | `MaxTemp` | 99 | °C | 이 이상 100% |
-| `WarmUpTemp` | 80 | °C | `IsWarmedUp` 설정(제어에는 미사용) |
-| 오일 고온 래치 | 103 / 100 | °C | 설정 / 해제 (코드 내 숫자) |
-| 오일 보정 시작 | 98 | °C | 1°C당 +1단계 (코드 내 숫자) |
+| `OilHotSetTemp` / `OilHotClearTemp` | 103 / 100 | °C | 오일 고온 래치 설정 / 해제 |
+| `OilBoostTemp` | 98 | °C | 오일 보정 시작, 1°C당 +1단계 |
+| `WarmUpTicks` / `WarmUpPeriodTicks` | 40 / 50 | 틱 | 워밍업 저듀티 구간 / 펄스 주기 |
+| `WarmUpLowIndex` / `WarmUpPulseIndex` | 1 / 5 | 단계 | 워밍업 저듀티 / 펄스 |
+| `FailSafeStep` | 2 | 단계 | 페일세이프 틱당 증가량 |
+| `RpmWindow` | 8 | 패킷 | 엔진 정지 판정에 쓰는 연속 RPM 0 패킷 수 |
 | `Duties[]` | 0–255, 12단계 | PWM | 듀티 단계표 |
 | `OPSampleMs` | 50 | ms | 유압 샘플 주기 |
 | `OPOversample` / `OPMedianSize` / `OPEmaAlpha` | 4 / 5 / 0.3 | – | 유압 필터 |
