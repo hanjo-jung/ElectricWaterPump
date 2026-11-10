@@ -1,6 +1,6 @@
 # 전동 워터펌프 제어 사양
 
-작성일: 2026-11-10
+버전: 1.1 · 날짜: 2026-11-10
 
 ## 개요
 
@@ -9,7 +9,7 @@
 - 대상 MCU: Arduino Leonardo 호환 CAN 보드(Longan Labs, MCP2515)
 - 구동: Cytron MD10C 모터 드라이버
 - 표시: Grove 16x2 I2C LCD, 선택 사항으로 능동 부저
-- 근거 자료: [README.md](../README.md), [EWPController.ino](../EWPController/EWPController.ino), [pump_control.cpp](../EWPController/pump_control.cpp), [test_pump_control.cpp](../test/test_pump_control.cpp), [2026-11-09-oil-pressure.md](2026-11-09-oil-pressure.md) (브랜치 `oil-pressure-median-filter`)
+- 근거 자료: [README.md](../README.md), [EWPController.ino](../EWPController/EWPController.ino), [pump_control.cpp](../EWPController/pump_control.cpp), [test_pump_control.cpp](../test/test_pump_control.cpp), [oil-pressure.md](oil-pressure.md) (브랜치 `oil-pressure-median-filter`)
 
 유압 필터와 유압 상실 경고는 `oil-pressure-median-filter` 브랜치에만 있고 main 미머지, 실차 미검증 상태다.
 
@@ -29,7 +29,7 @@
 | D8 (권장) | 부저 | 출력 | 기본 비활성 (`BuzzerPin = -1`), HIGH = 울림 |
 
 - 타이머: MsTimer2가 timer4를 쓰고 100ms마다 `Tick` 플래그를 세운다. 실제 처리는 `loop()`에서 버스 감시 → CAN 재초기화 → 엔진 정지 판정 → 듀티 결정·출력 → 표시 순으로 한다.
-- 부저는 차량 12V 능동형 피에조를 NPN 트랜지스터로 구동하는 구성을 권장한다(상세는 [2026-11-09-oil-pressure.md](2026-11-09-oil-pressure.md)).
+- 부저는 차량 12V 능동형 피에조를 NPN 트랜지스터로 구동하는 구성을 권장한다(상세는 [oil-pressure.md](oil-pressure.md)).
 
 ## 센서 입력 처리
 

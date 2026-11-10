@@ -1,6 +1,6 @@
 // Host-side tests for EWPController/pump_control.cpp.
 //   g++ -std=c++11 -Wall -Wextra -I EWPController test/test_pump_control.cpp EWPController/pump_control.cpp -o test_pump && ./test_pump
-// The expectations follow docs/2026-11-10-pump-control-spec.md. RefPumpDuty() is the
+// The expectations follow docs/pump-control-spec.md. RefPumpDuty() is the
 // SetPumpDuty() of commit 4a0d579 (before the extraction), kept to show that the
 // extraction did not change the control outside the intended fixes.
 #include <cstdio>

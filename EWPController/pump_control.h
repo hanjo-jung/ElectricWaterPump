@@ -1,6 +1,6 @@
 // Pump duty decision, independent of Arduino so it can be unit tested on a PC
 // (see test/test_pump_control.cpp). Called once per MonitorInterval (100 ms) tick.
-// Spec: docs/2026-11-10-pump-control-spec.md, "펌프 제어 로직".
+// Spec: docs/pump-control-spec.md, "펌프 제어 로직".
 #ifndef PUMP_CONTROL_H
 #define PUMP_CONTROL_H
 
