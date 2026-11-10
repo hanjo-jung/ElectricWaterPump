@@ -400,8 +400,13 @@ void SetPumpDuty()
    *       T           F             T         error
    *       F           T             T         normal
    *       T           T             T         hardly
+   *
+   * Before the engine has started, a CAN error also means fail-safe: otherwise a bus
+   * lost after the first RPM packet would keep the key-on 0% duty, and since no RPM
+   * arrives HasEngineStarted would never be set even after the engine is cranked.
    */
-  if (pumpOn || (!IsReadBegan && HasEngineStarted) || (!HasEngineStarted && !HasRpmReceived))
+  if (pumpOn || (!IsReadBegan && HasEngineStarted) ||
+      (!HasEngineStarted && (!HasRpmReceived || IsCANBusError)))
   {
     if (IndexDuty < MaxDutyIndex)
       IndexDuty += 2;
@@ -623,6 +628,9 @@ void SetBusSuccess(char c, int line)
  */
 void setup()
 {
+  // full duty until the controller can decide otherwise (the driver constructor leaves PWM LOW)
+  motor.setSpeed(Duties[MaxDutyIndex]);
+
   // switch input
   pinMode(OnPin, INPUT);
   if (BuzzerPin >= 0)
@@ -642,13 +650,18 @@ void setup()
 
   //attachInterrupt(digitalPinToInterrupt(7), MCP2515_ISR, FALLING); // start interrupt
 
-  while (CAN_OK != CAN.begin(CAN_500KBPS))    // init can bus : baudrate = 500k
+  // Do not block here: if the MCP2515 fails, the control loop still runs (fail-safe 100%,
+  // oil pressure monitoring) and CheckCount()/CheckEmpty() retry the init every second.
+  if (CAN_OK == CAN.begin(CAN_500KBPS))    // init can bus : baudrate = 500k
   {
-    SetBusError('E', __LINE__);
-    delay(100);
+    DBGLN("CANBus initialized");
+    SetBusSuccess('S', __LINE__);
   }
-  DBGLN("CANBus initialized");
-  SetBusSuccess('S', __LINE__);
+  else
+  {
+    DBGLN("CANBus init failed");
+    SetBusError('E', __LINE__);
+  }
 
   MsTimer2::set(MonitorInterval, timerFunc);
   MsTimer2::start();
