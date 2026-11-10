@@ -388,7 +388,8 @@ float MedianOf(const float *buf, int n)
 }
 
 // Reads the sensor and returns the filtered voltage (offset not applied).
-float ReadOilPressureVoltage()
+// median receives the median stage output, which reacts to a disconnect within 3 samples.
+float ReadOilPressureVoltage(float &median)
 {
   long sum = 0;
   for (int i = 0; i < OPOversample; ++i)
@@ -401,7 +402,7 @@ float ReadOilPressureVoltage()
   OPVoltIdx = (OPVoltIdx + 1) % OPMedianSize;
   if (OPVoltSamples < 32767) { OPVoltSamples++; }
   int n = (OPVoltSamples < OPMedianSize) ? OPVoltSamples : OPMedianSize;
-  float median = MedianOf(OPVoltRaw, n);
+  median = MedianOf(OPVoltRaw, n);
 
   if (OPVoltSamples == 1) { OPVoltEma = median; }
   else { OPVoltEma += OPEmaAlpha * (median - OPVoltEma); }
@@ -450,8 +451,13 @@ int MinOilPsi(int rpm, bool rpmValid)
  * DIP -> LOSS   : still below the minimum after OPLossMs
  * -> NORMAL     : at least minimum + hysteresis for OPRecoverMs
  * SENSOR_FAULT  : sensor voltage out of range, overrides the others
+ *
+ * sensorOk  : filtered (EMA) voltage in range; slow, so noise does not cause a false fault
+ * sampleOk  : median voltage in range; while false the sample is skipped for DIP/LOSS without
+ *             resetting the timers, so the EMA tail of a disconnect does not raise a DIP before
+ *             SENSOR_FAULT. A real loss reads ~0.5 V (0 psi), which stays in range.
  */
-void CheckOilPressure(unsigned long now, bool sensorOk, int psi, bool rpmValid)
+void CheckOilPressure(unsigned long now, bool sensorOk, bool sampleOk, int psi, bool rpmValid)
 {
   unsigned char prev = OPAlarm;
 
@@ -474,7 +480,7 @@ void CheckOilPressure(unsigned long now, bool sensorOk, int psi, bool rpmValid)
     else
     {
       if (OPRunningSince == 0) { OPRunningSince = now; }
-      if (now - OPRunningSince >= OPStartDelayMs)
+      if (sampleOk && now - OPRunningSince >= OPStartDelayMs)
       {
         int minPsi = MinOilPsi(CurRPM, rpmValid);
         if (psi < minPsi)
@@ -533,7 +539,8 @@ void SampleOilPressure()
   LastOPSampleMs = now;
 
   bool rpmValid = HasRpmReceived && (now - LastRpmMs) < RpmStaleMs;
-  float voltage = ReadOilPressureVoltage();
+  float median;
+  float voltage = ReadOilPressureVoltage(median);
 
   if (rpmValid && CurRPM == 0 && !HasEngineStarted)
   {
@@ -542,12 +549,13 @@ void SampleOilPressure()
   }
 
   bool sensorOk = (OPSensorMinVolt <= voltage && voltage <= OPSensorMaxVolt);
+  bool sampleOk = (OPSensorMinVolt <= median && median <= OPSensorMaxVolt);
   int psi = OilPsiFromVoltage(voltage);
-  if (sensorOk && rpmValid && CurRPM > 0)
+  if (sensorOk && sampleOk && rpmValid && CurRPM > 0)
   {
     AddToOPLog(CurRPM, psi);
   }
-  CheckOilPressure(now, sensorOk, psi, rpmValid);
+  CheckOilPressure(now, sensorOk, sampleOk, psi, rpmValid);
   UpdateBuzzer(now);
 }
 
